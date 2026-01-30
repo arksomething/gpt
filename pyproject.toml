@@ -1,0 +1,34 @@
+[project]
+name = "llm-100m"
+version = "0.1.0"
+description = "Train a ~100M parameter Llama-style model on RTX 4090s."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "accelerate",
+  "datasets",
+  "numpy",
+  "pyyaml",
+  "sentencepiece",
+  "torch",
+  "transformers",
+  "tqdm",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["scripts"]
+
+[project.scripts]
+ls = "scripts.ls:main"
+train = "scripts.train:main"
+eval = "scripts.eval:main"
+prepare-data = "scripts.prepare_data:main"
+train-tokenizer = "scripts.train_tokenizer:main"
+benchmark = "scripts.benchmark_throughput:main"
+tokenizer-repl = "scripts.tokenizer_repl:main"
+scan-bins = "scripts.scan_bins:main"
+

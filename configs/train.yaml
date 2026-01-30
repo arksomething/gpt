@@ -1,0 +1,140 @@
+data:
+  train_bin: data/train.bin
+  val_bin: data/val.bin
+  block_size: 2048
+  dtype: uint16
+  vocab_size: 32000
+
+data_prep:
+  tokenizer_model: tokenizer/spm.model
+  out_dir: data
+  train_tokens: 2000000000
+  val_tokens: 20000000
+  c4_weight: 0.9
+  wiki_weight: 0.1
+  shuffle_buffer: 50000
+  min_chars: 200
+  seed: 1337
+  log_interval: 30
+
+eval:
+  checkpoint: runs/llama-100m/final
+  tokenizer_model: tokenizer/spm.model
+  batches: 200
+  prompt: "The quick brown fox"
+  min_new_tokens: 16
+  max_new_tokens: 100
+  temperature: 0.7
+  top_p: 0.9
+  top_k: 50
+  repetition_penalty: 1.1
+
+tokenizer_training:
+  output_dir: tokenizer
+  vocab_size: 32000
+  c4_weight: 0.9
+  wiki_weight: 0.1
+  min_chars: 200
+  max_chars: 50000000
+  shuffle_buffer: 50000
+  seed: 1337
+
+training:
+  seed: 1337
+  micro_batch_size: 4
+  grad_accum_steps: 32
+  learning_rate: 2.0e-4
+  weight_decay: 0.1
+  betas: [0.9, 0.95]
+  warmup_steps: 2000
+  max_steps: 7630
+  eval_interval: 200
+  log_interval: 50
+  save_interval: 500
+  output_dir: runs/llama-100m
+  precision: bf16
+  max_grad_norm: 1.0
+  gradient_checkpointing: true
+  allow_tf32: true
+  checkpoint_limit: 3
+
+checkpoint_slots:
+  best: 1
+  good: ["good"]
+
+logging:
+  enabled: true
+  console_summary: true
+  log_file: auto  # "auto" writes to {output_dir}/train.log, or specify a path, or null to disable
+  tensorboard:
+    enabled: false
+    log_dir: null
+  wandb:
+    enabled: false
+    project: llm-100m
+    name: null
+    entity: null
+    tags: []
+    group: null
+    config: null
+
+runtime_control:
+  enabled: true
+  control_path: null  # defaults to {output_dir}/runtime_control.yaml
+  command_path: null  # defaults to {output_dir}/commands.jsonl
+  poll_interval_steps: 10
+  # Edit runtime_control.yaml during training to change these on the fly:
+  allowed_updates:
+    - training.eval_interval
+    - training.save_interval
+    - training.log_interval
+    - training.learning_rate
+    - checks.fixed_prompt.enabled
+    - checks.fixed_prompt.deterministic
+    - checks.fixed_prompt.max_new_tokens
+    - checks.fixed_prompt.min_new_tokens
+    - checks.fixed_prompt.temperature
+    - checks.fixed_prompt.top_p
+    - checks.fixed_prompt.top_k
+    - checks.fixed_prompt.repetition_penalty
+    - checks.fixed_prompt.prompt
+    - checks.fixed_prompt.prompt_list
+    - checks.fixed_prompt.prompt_list_path
+
+budget:
+  target_tokens: 2000000000
+  hourly_rate: 0.35
+  max_cost: 100.0
+  throughput_path: runs/throughput.json
+
+checks:
+  overfit_microset:
+    enabled: true
+    tokens: 5000000
+    steps: 100
+    eval_batches: 20
+    min_drop: 0.3
+    target_loss: null
+    warmup_steps: 0
+    log_interval: 10
+    run_on_smoke: false
+  fixed_prompt:
+    enabled: true
+    tokenizer_model: tokenizer/spm.model
+    prompt: "The quick brown fox"  # fallback if prompt_list is empty
+    prompt_list_path: null
+    prompt_list:
+      - "The quick brown fox"
+      - "Once upon a time,"
+      - "The capital of France is"
+      - "To solve this problem,"
+    deterministic: true  # greedy decoding for clearer signal
+    max_new_tokens: 120
+    min_new_tokens: 16
+    temperature: 1.0
+    top_p: 0.95
+    top_k: 100
+    repetition_penalty: 1.2
+    seed: 1337
+    output_path: null
+    run_on_smoke: false
