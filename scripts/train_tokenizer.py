@@ -106,6 +106,7 @@ def main():
                 "--eos_id=2",
                 "--pad_id=3",
                 "--hard_vocab_limit=false",
+                "--minloglevel=1",  # reduce console spam (0=INFO, 1=WARNING, 2=ERROR)
             ]
         )
     )

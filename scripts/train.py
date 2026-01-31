@@ -168,23 +168,21 @@ def maybe_apply_budget_guard(budget, tokens_per_step):
 
 
 def rotate_checkpoints(output_dir, limit, protected=None):
+    """Keep at most `limit` total checkpoints, deleting oldest unprotected first."""
     if limit <= 0:
         return
     protected = set(protected or [])
     entries = [d for d in os.listdir(output_dir) if d.startswith("step_")]
-    entries = [entry for entry in entries if entry not in protected]
-    if len(entries) <= limit:
+    total_count = len(entries)
+    if total_count <= limit:
         return
-    entries.sort()
-    to_remove = entries[: max(0, len(entries) - limit)]
+    # Delete oldest unprotected checkpoints until we have at most `limit` total
+    unprotected = sorted([e for e in entries if e not in protected])
+    to_remove_count = total_count - limit
+    to_remove = unprotected[:to_remove_count]
     for name in to_remove:
         path = os.path.join(output_dir, name)
-        for root, dirs, files in os.walk(path, topdown=False):
-            for file in files:
-                os.remove(os.path.join(root, file))
-            for d in dirs:
-                os.rmdir(os.path.join(root, d))
-        os.rmdir(path)
+        shutil.rmtree(path)
 
 
 def _load_json(path):
@@ -783,7 +781,11 @@ def main():
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
-    accelerator = Accelerator(mixed_precision=optim_cfg.get("precision", "bf16"))
+    grad_accum = int(optim_cfg["grad_accum_steps"])
+    accelerator = Accelerator(
+        mixed_precision=optim_cfg.get("precision", "bf16"),
+        gradient_accumulation_steps=grad_accum,
+    )
     device = accelerator.device
 
     dtype = np.dtype(data_cfg["dtype"])
@@ -818,7 +820,6 @@ def main():
 
     block_size = data_cfg["block_size"]
     micro_batch = optim_cfg["micro_batch_size"]
-    grad_accum = optim_cfg["grad_accum_steps"]
     world_size = accelerator.num_processes
     tokens_per_step = micro_batch * block_size * grad_accum * world_size
     target_steps = maybe_apply_budget_guard(budget_cfg, tokens_per_step)
