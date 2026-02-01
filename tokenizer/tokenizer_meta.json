@@ -1,9 +1,10 @@
 {
   "vocab_size": 32000,
-  "c4_weight": 0.9,
-  "wiki_weight": 0.1,
+  "c4_weight": 0.4,
+  "wiki_weight": 0.6,
+  "gutenberg_weight": 0.0,
   "min_chars": 200,
   "max_chars": 50000000,
   "seed": 1337,
-  "trained_at": "2026-01-29T17:10:48.735278Z"
+  "trained_at": "2026-02-01T00:08:00.746276Z"
 }

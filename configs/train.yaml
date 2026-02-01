@@ -10,12 +10,46 @@ data_prep:
   out_dir: data
   train_tokens: 2000000000
   val_tokens: 20000000
-  c4_weight: 0.9
-  wiki_weight: 0.1
-  shuffle_buffer: 50000
-  min_chars: 200
+  
+  # Source weights (should sum to 1.0)
+  # Note: Gutenberg disabled due to pg19 dataset compatibility issues
+  c4_weight: 0.40
+  wiki_weight: 0.60
+  gutenberg_weight: 0.0
+  
+  shuffle_buffer: 1000
   seed: 1337
   log_interval: 30
+  
+  # Global filter parameters (G0-G5)
+  min_chars: 300
+  max_chars: 80000
+  min_alpha_ratio: 0.65
+  max_repeated_chars: 6
+  max_weird_ratio: 0.01
+  max_short_line_ratio: 0.30
+  max_caps_ratio: 0.20
+  
+  # C4-specific filter parameters (C1-C6)
+  c4_min_alpha_ratio: 0.70
+  c4_max_punct_ratio: 0.20
+  c4_min_entropy: 3.5
+  c4_max_entropy: 5.6
+  
+  # Wikipedia-specific (W1)
+  wiki_max_list_ratio: 0.30
+  
+  # Gutenberg-specific (GUT2)
+  gutenberg_filter_poetry: false
+  
+  # Deduplication (G6)
+  dedup_enabled: true
+  dedup_similarity_threshold: 0.85
+  dedup_num_perm: 128
+  
+  # Chunking
+  max_chunk_chars: 8000
+  min_chunk_chars: 500
 
 eval:
   checkpoint: runs/llama-100m/final
@@ -32,11 +66,10 @@ eval:
 tokenizer_training:
   output_dir: tokenizer
   vocab_size: 32000
-  c4_weight: 0.9
-  wiki_weight: 0.1
+  # Note: Uses c4_weight, wiki_weight, gutenberg_weight from data_prep section
   min_chars: 200
   max_chars: 50000000
-  shuffle_buffer: 50000
+  shuffle_buffer: 1000
   seed: 1337
 
 training:
