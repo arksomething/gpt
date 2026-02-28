@@ -1,6 +1,8 @@
+# Archived snapshot of configs/train.yaml before v2 pipeline update.
+# Archived on 2026-02-28.
 data:
-  train_bin: data/v2/train.bin
-  val_bin: data/v2/val.bin
+  train_bin: data/train.bin
+  val_bin: data/val.bin
   block_size: 2048
   dtype: uint16
   vocab_size: 32000
@@ -16,15 +18,15 @@ data:
 
 data_prep:
   tokenizer_model: tokenizer/spm.model
-  out_dir: data/v2
+  out_dir: data
   train_tokens: 2000000000
   val_tokens: 20000000
   
   # Source weights (should sum to 1.0)
-  # Speed-oriented mix: disable Gutenberg for data prep
-  c4_weight: 0.40
-  wiki_weight: 0.60
-  gutenberg_weight: 0.00
+  # Gutenberg provides high-quality literary prose
+  c4_weight: 0.35
+  wiki_weight: 0.45
+  gutenberg_weight: 0.20
   
   shuffle_buffer: 1000
   seed: 1337
@@ -61,7 +63,7 @@ data_prep:
   min_chunk_chars: 500
 
 eval:
-  checkpoint: runs/llama-100m-v2/final
+  checkpoint: runs/llama-100m/final
   tokenizer_model: tokenizer/spm.model
   batches: 200
   prompt: "The quick brown fox"
@@ -73,7 +75,7 @@ eval:
   repetition_penalty: 1.1
 
 inference:
-  checkpoint: runs/llama-100m-v2/final
+  checkpoint: runs/llama-100m/final
   model_config: configs/model_100m.yaml
   tokenizer: tokenizer/spm.model
   max_tokens: 100
@@ -99,12 +101,12 @@ training:
   learning_rate: 2.0e-4
   weight_decay: 0.1
   betas: [0.9, 0.95]
-  warmup_steps: 400
+  warmup_steps: 2000
   max_steps: 7630
   eval_interval: 200
   log_interval: 50
   save_interval: 500
-  output_dir: runs/llama-100m-v2
+  output_dir: runs/llama-100m
   precision: bf16
   max_grad_norm: 1.0
   gradient_checkpointing: true
