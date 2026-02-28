@@ -32,4 +32,5 @@ train-tokenizer = "scripts.train_tokenizer:main"
 benchmark = "scripts.benchmark_throughput:main"
 tokenizer-repl = "scripts.tokenizer_repl:main"
 scan-bins = "scripts.scan_bins:main"
+infer = "scripts.infer:main"
 

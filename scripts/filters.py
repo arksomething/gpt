@@ -74,15 +74,16 @@ def filter_weird_symbols(text: str, max_ratio: float = 0.01) -> bool:
 
 def filter_line_structure(
     text: str,
-    max_short_ratio: float = 0.30,
-    max_caps_ratio: float = 0.20,
-    short_threshold: int = 20,
+    max_short_ratio: float = 0.40,
+    max_caps_ratio: float = 0.25,
+    short_threshold: int = 15,
 ) -> bool:
     """
     G4: Line structure filter.
     Drop if:
     - >max_short_ratio of lines are very short (<short_threshold chars)
     - OR >max_caps_ratio of lines are ALL CAPS
+    Relaxed thresholds to allow more valid content.
     """
     lines = text.split("\n")
     if not lines:
@@ -367,14 +368,417 @@ def filter_entropy(text: str, min_entropy: float = 3.5, max_entropy: float = 5.6
     return min_entropy <= entropy <= max_entropy
 
 
+def filter_repetitive_phrases(
+    text: str,
+    min_phrase_len: int = 4,
+    max_phrase_len: int = 12,
+    max_repeat_ratio: float = 0.03,
+) -> bool:
+    """
+    C7: Drop if any phrase repeats too many times (SEO spam indicator).
+    Checks for repeated word n-grams that appear suspiciously often.
+    """
+    words = text.lower().split()
+    if len(words) < 20:
+        return True
+    
+    total_words = len(words)
+    
+    # Check various n-gram sizes
+    for n in range(min_phrase_len, min(max_phrase_len + 1, len(words))):
+        ngram_counts: Counter = Counter()
+        for i in range(len(words) - n + 1):
+            ngram = " ".join(words[i:i+n])
+            ngram_counts[ngram] += 1
+        
+        # Check if any n-gram appears too frequently
+        for ngram, count in ngram_counts.most_common(5):
+            if count > 2:  # Must appear at least 3 times
+                # Ratio of words covered by this repeated phrase
+                phrase_coverage = (count * n) / total_words
+                if phrase_coverage > max_repeat_ratio:
+                    return False
+    
+    return True
+
+
+def filter_url_attribution(
+    text: str,
+    max_url_ratio: float = 0.02,
+    max_attribution_matches: int = 3,
+) -> bool:
+    """
+    C8: Drop if text contains excessive URL patterns or image attribution.
+    Catches scraped content with "sourced from:", "screenshot from:", etc.
+    """
+    text_lower = text.lower()
+    text_len = len(text)
+    
+    # Count URL-like patterns
+    url_patterns = [
+        r"https?://[^\s]+",
+        r"www\.[^\s]+",
+        r"\.com[/\s]",
+        r"\.org[/\s]",
+        r"\.net[/\s]",
+    ]
+    url_count = 0
+    for pattern in url_patterns:
+        url_count += len(re.findall(pattern, text_lower))
+    
+    if text_len > 0 and url_count / (text_len / 100) > max_url_ratio:
+        return False
+    
+    # Check for attribution patterns (scraped content)
+    attribution_patterns = [
+        "sourced from:",
+        "screenshot from:",
+        "image from:",
+        "photo from:",
+        "received from:",
+        "courtesy of:",
+        "credit:",
+        "via:",
+        "source:",
+        "from:",
+    ]
+    # More specific patterns that indicate scraping
+    scrape_patterns = [
+        r"screenshot (?:sourced|received|taken) from",
+        r"image (?:sourced|received|taken) from",
+        r"(?:sourced|received) from: \w+\.com",
+        r"bring it (?:along|with you|together)",  # Common in scraped content
+        r"take it (?:along|with you|together)",
+    ]
+    
+    scrape_count = 0
+    for pattern in scrape_patterns:
+        scrape_count += len(re.findall(pattern, text_lower))
+    
+    if scrape_count >= max_attribution_matches:
+        return False
+    
+    return True
+
+
+def filter_bibliography_heavy(
+    text: str,
+    max_biblio_ratio: float = 0.25,
+) -> bool:
+    """
+    C9: Drop if text is dominated by bibliography/reference patterns.
+    Catches encyclopedia articles that are mostly citation lists.
+    """
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    if len(lines) < 5:
+        return True
+    
+    biblio_patterns = [
+        r"^\d{4}[.:)]",  # Year at start: "1998." or "1998:"
+        r"^\([^)]+\)\s*$",  # Parenthetical only: "(Paris, 1789)"
+        r"vol\.\s*\d+",  # Volume references
+        r"pp?\.\s*\d+",  # Page references  
+        r"ISBN\s*[\d-]+",
+        r"ISSN\s*[\d-]+",
+        r"et\s+al\.",
+        r"^\s*[\-–—]\s*",  # Lines starting with dashes (bibliographic entries)
+        r"reprint|reprinted",
+        r"edition|ed\.",
+        r"translated by|trans\.",
+        r"edited by",
+        r"published by",
+    ]
+    
+    biblio_lines = 0
+    for line in lines:
+        line_lower = line.lower()
+        for pattern in biblio_patterns:
+            if re.search(pattern, line_lower, re.IGNORECASE):
+                biblio_lines += 1
+                break
+    
+    if biblio_lines / len(lines) > max_biblio_ratio:
+        return False
+    
+    return True
+
+
+def filter_listicle_pattern(
+    text: str,
+    max_repetitive_starts: float = 0.20,
+) -> bool:
+    """
+    C10: Drop if text has listicle structure (many lines starting same way).
+    Catches "10 Ways to..." style low-quality content.
+    """
+    lines = [l.strip() for l in text.split("\n") if len(l.strip()) > 10]
+    if len(lines) < 5:
+        return True
+    
+    # Get first few words of each line
+    line_starts: Counter = Counter()
+    for line in lines:
+        words = line.split()[:3]
+        if len(words) >= 2:
+            start = " ".join(words[:2]).lower()
+            line_starts[start] += 1
+    
+    # Check if any start pattern is too common
+    total_lines = len(lines)
+    for start, count in line_starts.most_common(3):
+        if count >= 3 and count / total_lines > max_repetitive_starts:
+            return False
+    
+    return True
+
+
+def filter_low_info_density(
+    text: str,
+    min_unique_word_ratio: float = 0.35,
+    max_filler_ratio: float = 0.15,
+) -> bool:
+    """
+    C11: Drop if text has low information density.
+    Catches repetitive, low-quality content.
+    """
+    words = re.findall(r'\b[a-z]+\b', text.lower())
+    if len(words) < 50:
+        return True
+    
+    # Check unique word ratio
+    unique_words = set(words)
+    unique_ratio = len(unique_words) / len(words)
+    if unique_ratio < min_unique_word_ratio:
+        return False
+    
+    # Check for filler phrases
+    filler_phrases = [
+        "you will", "you can", "you may", "you should",
+        "it is", "it was", "it will", "it can",
+        "this is", "this was", "this will",
+        "that is", "that was", "that will",
+        "there is", "there are", "there was", "there were",
+        "as well as", "in order to", "due to the fact",
+        "at the end of the day", "when it comes to",
+        "in terms of", "on the other hand",
+    ]
+    
+    text_lower = text.lower()
+    filler_count = 0
+    for phrase in filler_phrases:
+        filler_count += text_lower.count(phrase)
+    
+    word_count = len(words)
+    if word_count > 0 and filler_count / (word_count / 10) > max_filler_ratio:
+        return False
+    
+    return True
+
+
+def filter_non_latin_heavy(
+    text: str,
+    max_non_latin_ratio: float = 0.01,
+) -> bool:
+    """
+    C14: Drop if text has too many non-Latin characters.
+    These become unknown tokens (⁇) after tokenization.
+    Very strict - even 1% non-Latin is rejected.
+    """
+    if not text:
+        return True
+    
+    # Count non-Latin alphabetic characters
+    non_latin_count = 0
+    latin_count = 0
+    for char in text:
+        if char.isalpha():
+            # Check if it's in basic Latin range (ASCII + Latin-1 Supplement)
+            if ord(char) < 256:
+                latin_count += 1
+            else:
+                non_latin_count += 1
+    
+    total_alpha = latin_count + non_latin_count
+    if total_alpha == 0:
+        return True
+    
+    # Reject if ANY non-Latin characters when text is short
+    if total_alpha < 500 and non_latin_count > 0:
+        return False
+    
+    if non_latin_count / total_alpha > max_non_latin_ratio:
+        return False
+    
+    return True
+
+
+def filter_reference_sections(
+    text: str,
+    max_ref_line_ratio: float = 0.10,
+) -> bool:
+    """
+    C15: Drop if text is dominated by reference/link patterns.
+    Catches Wikipedia footers, citation sections, etc.
+    """
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    if len(lines) < 3:
+        return True
+    
+    ref_patterns = [
+        r"^\^",  # Citation markers
+        r"^\[\d+\]",  # [1], [2] references
+        r"^https?://",  # URLs at line start
+        r"^www\.",  # www URLs
+        r"^\d+\.\s+\^",  # Numbered citations
+        r"^Category:",  # Wikipedia categories
+        r"^Categories:",
+        r"^\*\s*\[",  # Bullet with link
+        r"^\*\s*http",  # Bullet with URL
+        r"^Retrieved\s",  # "Retrieved from..."
+        r"^Archived\s",  # "Archived from..."
+        r"^ISBN\s",
+        r"^ISSN\s",
+        r"^doi:",
+        r"^pmid:",
+        r"^arXiv:",
+    ]
+    
+    ref_lines = 0
+    for line in lines:
+        for pattern in ref_patterns:
+            if re.match(pattern, line, re.IGNORECASE):
+                ref_lines += 1
+                break
+    
+    if ref_lines / len(lines) > max_ref_line_ratio:
+        return False
+    
+    return True
+
+
+def filter_category_lists(
+    text: str,
+    max_category_ratio: float = 0.25,
+) -> bool:
+    """
+    C16: Drop if text ends with category/tag lists (Wikipedia footers).
+    More lenient - only reject if dominated by categories.
+    """
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    if len(lines) < 10:
+        return True
+    
+    # Check last N lines for category patterns
+    check_lines = lines[-min(15, len(lines)):]
+    
+    category_patterns = [
+        r"^(People|Living people|Deaths|Births)$",
+        r"^\d{4} (births|deaths)$",
+    ]
+    
+    category_count = 0
+    for line in check_lines:
+        # Very short lines at the end that look like categories
+        if len(line) < 40:
+            for pattern in category_patterns:
+                if re.match(pattern, line):
+                    category_count += 1
+                    break
+    
+    if len(check_lines) > 0 and category_count / len(check_lines) > max_category_ratio:
+        return False
+    
+    return True
+
+
+def filter_bad_start(text: str) -> bool:
+    """
+    C17: Drop if text starts mid-sentence or with garbage.
+    Catches chunks that were cut at bad boundaries.
+    """
+    text = text.lstrip()
+    if not text:
+        return False
+    
+    # Bad starting characters (mid-sentence indicators)
+    bad_starts = [
+        ',', ';', ':', '.', '!', '?',  # Punctuation
+        ')', ']', '}', '>',  # Closing brackets
+        "'s ", "'t ", "'ve ", "'re ", "'ll ", "'d ",  # Contractions
+        "and ", "or ", "but ", "so ", "yet ",  # Conjunctions (lowercase)
+        "which ", "that ", "who ", "whom ", "whose ",  # Relative pronouns (lowercase)
+        "is ", "are ", "was ", "were ", "be ", "been ",  # Verbs (lowercase)
+        "in ", "on ", "at ", "to ", "for ", "with ",  # Prepositions (lowercase)
+    ]
+    
+    for bad in bad_starts:
+        if text.startswith(bad):
+            return False
+    
+    # Check if first character is lowercase letter (mid-sentence)
+    first_char = text[0]
+    if first_char.islower():
+        return False
+    
+    return True
+
+
+def filter_bad_end(text: str) -> bool:
+    """
+    C18: Drop if text ends mid-sentence.
+    """
+    text = text.rstrip()
+    if not text:
+        return False
+    
+    # Should end with sentence-ending punctuation or quote
+    good_endings = '.!?"\')'
+    
+    # Check last non-whitespace character
+    last_char = text[-1]
+    if last_char not in good_endings:
+        words = text.split()
+        if words:
+            last_word = words[-1].rstrip('.,;:!?"\'-)')
+            last_word_lower = last_word.lower()
+            
+            # Common words that indicate mid-sentence cutoff
+            bad_ending_words = {
+                'the', 'a', 'an', 'and', 'or', 'but', 'so', 'yet', 'for', 'nor',
+                'in', 'on', 'at', 'to', 'of', 'by', 'with', 'from', 'into', 'onto',
+                'is', 'are', 'was', 'were', 'be', 'been', 'being',
+                'has', 'have', 'had', 'having',
+                'do', 'does', 'did', 'doing',
+                'will', 'would', 'could', 'should', 'may', 'might', 'must', 'shall',
+                'that', 'which', 'who', 'whom', 'whose', 'where', 'when', 'while',
+                'if', 'then', 'than', 'as', 'because', 'although', 'though',
+                'this', 'that', 'these', 'those', 'its', 'his', 'her', 'their', 'our',
+                'not', "didn't", "doesn't", "wasn't", "weren't", "isn't", "aren't",
+                "won't", "wouldn't", "couldn't", "shouldn't", "can't", "haven't",
+            }
+            
+            if last_word_lower in bad_ending_words:
+                return False
+            
+            # If last word is very short (<=3), probably cut off
+            if len(last_word) <= 3:
+                return False
+            
+            # If ends with common incomplete patterns
+            if last_word_lower.endswith("'s") or last_word_lower.endswith("n't"):
+                return False
+    
+    return True
+
+
 def apply_c4_filters(
     text: str,
     min_alpha_ratio: float = 0.70,
     max_punct_ratio: float = 0.20,
     web_junk_keywords: Optional[List[str]] = None,
     max_web_junk_matches: int = 2,
-    min_paragraphs: int = 2,
-    min_avg_para_length: int = 200,
+    min_paragraphs: int = 1,
+    min_avg_para_length: int = 80,
     min_entropy: float = 3.5,
     max_entropy: float = 5.6,
 ) -> Tuple[bool, str]:
@@ -394,6 +798,30 @@ def apply_c4_filters(
         return False, "C5_paragraph_quality"
     if not filter_entropy(text, min_entropy, max_entropy):
         return False, "C6_entropy"
+    if not filter_repetitive_phrases(text):
+        return False, "C7_repetitive_phrases"
+    if not filter_url_attribution(text):
+        return False, "C8_url_attribution"
+    if not filter_bibliography_heavy(text):
+        return False, "C9_bibliography"
+    if not filter_listicle_pattern(text):
+        return False, "C10_listicle"
+    if not filter_low_info_density(text):
+        return False, "C11_low_info"
+    if not filter_list_heavy(text, max_list_ratio=0.15):
+        return False, "C12_list_heavy"
+    if not filter_structured_data(text, max_structured_ratio=0.20):
+        return False, "C13_structured_data"
+    if not filter_non_latin_heavy(text):
+        return False, "C14_non_latin"
+    if not filter_reference_sections(text):
+        return False, "C15_references"
+    if not filter_category_lists(text):
+        return False, "C16_categories"
+    if not filter_bad_start(text):
+        return False, "C17_bad_start"
+    if not filter_bad_end(text):
+        return False, "C18_bad_end"
     return True, ""
 
 
@@ -455,18 +883,50 @@ def filter_list_heavy(text: str, max_list_ratio: float = 0.30) -> bool:
 
     # Count lines that look like list items
     list_patterns = [
-        r"^\s*[\*\-\•]\s",  # Bullet points
-        r"^\s*\d+[\.\)]\s",  # Numbered lists
+        r"^\s*[\*\-\•\→\►\▪\◦\‣]\s",  # Bullet points (expanded)
+        r"^\s*\d+[\.\):\-]\s",  # Numbered lists: "1." "1)" "1:" "1-"
         r"^\s*[a-zA-Z][\.\)]\s",  # Lettered lists
+        r"^\s*[ivxIVX]+[\.\)]\s",  # Roman numeral lists
+        r"^\s*\[[^\]]+\]\s*$",  # Category tags: [Category Name]
+        r"^\s*\w+[^.!?]{0,40}:\s*[\d,\.]+\s*(rifles?|troops?|men|soldiers?|people|km|m|ft|miles?|hours?|days?|years?)?\s*$",  # "Label: number" patterns
     ]
     list_count = 0
     for line in lines:
         for pattern in list_patterns:
-            if re.match(pattern, line):
+            if re.match(pattern, line, re.IGNORECASE):
                 list_count += 1
                 break
 
     return list_count / len(lines) <= max_list_ratio
+
+
+def filter_structured_data(text: str, max_structured_ratio: float = 0.25) -> bool:
+    """
+    W1b: Drop text that looks like structured data (tables, key-value pairs).
+    Catches Wikipedia infoboxes, data tables, etc.
+    """
+    lines = [line for line in text.split("\n") if line.strip()]
+    if len(lines) < 5:
+        return True
+    
+    structured_patterns = [
+        r"^[^:]{1,40}:\s+.+$",  # Key: Value patterns (short keys)
+        r"^\|",  # Wiki table rows
+        r"^!",  # Wiki table headers
+        r"^\{",  # Template starts
+        r"^[A-Z][a-z]+:\s*\d",  # "Population: 12345"
+        r"^[A-Z][a-z]+:\s*[A-Z]",  # "Capital: London"
+        r"^\s*\d{4}\s*[-–:]\s*\d",  # Year ranges or year: number patterns
+    ]
+    
+    structured_count = 0
+    for line in lines:
+        for pattern in structured_patterns:
+            if re.match(pattern, line.strip()):
+                structured_count += 1
+                break
+    
+    return structured_count / len(lines) <= max_structured_ratio
 
 
 def count_sentences(text: str) -> int:
@@ -502,7 +962,7 @@ def strip_wiki_markup(text: str) -> str:
     return text.strip()
 
 
-def apply_wiki_filters(text: str, max_list_ratio: float = 0.30) -> Tuple[str, bool, str]:
+def apply_wiki_filters(text: str, max_list_ratio: float = 0.20) -> Tuple[str, bool, str]:
     """
     Apply Wikipedia-specific filters and transformations.
     Returns (transformed_text, passed, reason).
@@ -514,8 +974,16 @@ def apply_wiki_filters(text: str, max_list_ratio: float = 0.30) -> Tuple[str, bo
     # Then apply filters
     if not filter_list_heavy(text, max_list_ratio):
         return text, False, "W1_list_heavy"
+    if not filter_structured_data(text):
+        return text, False, "W1b_structured_data"
     if not filter_short_paragraphs(text):
         return text, False, "W2_short_paragraphs"
+    if not filter_non_latin_heavy(text):
+        return text, False, "W3_non_latin"
+    if not filter_reference_sections(text):
+        return text, False, "W4_references"
+    if not filter_category_lists(text):
+        return text, False, "W5_categories"
 
     return text, True, ""
 
@@ -626,12 +1094,54 @@ def strip_toc(text: str) -> str:
     return "\n".join(result_lines)
 
 
+def strip_chapter_headers(text: str) -> str:
+    """
+    GUT2b: Strip chapter/section headers from Gutenberg text.
+    Removes lines like "CHAPTER XVIII", "Chapter 1", "PART II", etc.
+    """
+    lines = text.split("\n")
+    result_lines = []
+    
+    # Patterns for chapter/section headers to remove
+    header_patterns = [
+        r"^\s*CHAPTER\s+[IVXLCDM\d]+\.?\s*$",  # CHAPTER XVIII or CHAPTER 18
+        r"^\s*Chapter\s+[IVXLCDM\d]+\.?\s*$",  # Chapter XVIII or Chapter 18
+        r"^\s*PART\s+[IVXLCDM\d]+\.?\s*$",  # PART II
+        r"^\s*Part\s+[IVXLCDM\d]+\.?\s*$",  # Part II
+        r"^\s*BOOK\s+[IVXLCDM\d]+\.?\s*$",  # BOOK III
+        r"^\s*Book\s+[IVXLCDM\d]+\.?\s*$",  # Book III
+        r"^\s*SECTION\s+[IVXLCDM\d]+\.?\s*$",  # SECTION IV
+        r"^\s*Section\s+[IVXLCDM\d]+\.?\s*$",  # Section IV
+        r"^\s*ACT\s+[IVXLCDM\d]+\.?\s*$",  # ACT III (plays)
+        r"^\s*Act\s+[IVXLCDM\d]+\.?\s*$",  # Act III
+        r"^\s*SCENE\s+[IVXLCDM\d]+\.?\s*$",  # SCENE II
+        r"^\s*Scene\s+[IVXLCDM\d]+\.?\s*$",  # Scene II
+        r"^\s*[IVXLCDM]+\.\s*$",  # Just "XVIII." alone
+        r"^\s*\d+\.\s*$",  # Just "18." alone
+    ]
+    
+    for line in lines:
+        is_header = False
+        for pattern in header_patterns:
+            if re.match(pattern, line, re.IGNORECASE):
+                is_header = True
+                break
+        if not is_header:
+            result_lines.append(line)
+    
+    return "\n".join(result_lines)
+
+
 def normalize_gutenberg(text: str) -> str:
     """
     GUT3: Normalize Gutenberg text.
+    - Strip chapter headers
     - Join hyphenated line breaks (scanning artifact)
     - Merge hard-wrapped lines into paragraphs
     """
+    # Strip chapter/section headers first
+    text = strip_chapter_headers(text)
+    
     # Join hyphenated words split across lines
     text = re.sub(r"-\n\s*", "", text)
 
@@ -718,7 +1228,8 @@ def chunk_text(
 ) -> List[str]:
     """
     Split long text into chunks of reasonable size.
-    Tries to split on paragraph boundaries.
+    Tries to split on paragraph boundaries, then sentence boundaries.
+    Ensures chunks start and end cleanly.
     """
     if len(text) <= max_chars:
         return [text] if len(text) >= min_chars else []
@@ -736,34 +1247,38 @@ def chunk_text(
 
         part_len = len(part)
 
-        # If single part is too long, split it further
+        # If single part is too long, split it further on sentences
         if part_len > max_chars:
             # Flush current chunk
             if current_chunk:
-                chunk_text = f"{split_on}".join(current_chunk)
-                if len(chunk_text) >= min_chars:
-                    chunks.append(chunk_text)
+                chunk_text_str = f"{split_on}".join(current_chunk)
+                if len(chunk_text_str) >= min_chars:
+                    chunks.append(chunk_text_str)
                 current_chunk = []
                 current_len = 0
 
-            # Split large part on sentences
-            sentences = re.split(r"(?<=[.!?])\s+", part)
+            # Split large part on sentence boundaries
+            # More robust sentence splitting
+            sentences = re.split(r'(?<=[.!?])\s+(?=[A-Z])', part)
             for sentence in sentences:
+                sentence = sentence.strip()
+                if not sentence:
+                    continue
                 if current_len + len(sentence) > max_chars and current_chunk:
-                    chunk_text = " ".join(current_chunk)
-                    if len(chunk_text) >= min_chars:
-                        chunks.append(chunk_text)
+                    chunk_text_str = " ".join(current_chunk)
+                    if len(chunk_text_str) >= min_chars:
+                        chunks.append(chunk_text_str)
                     current_chunk = []
                     current_len = 0
                 current_chunk.append(sentence)
-                current_len += len(sentence)
+                current_len += len(sentence) + 1  # +1 for space
             continue
 
         # Check if adding this part would exceed max
         if current_len + part_len + len(split_on) > max_chars and current_chunk:
-            chunk_text = f"{split_on}".join(current_chunk)
-            if len(chunk_text) >= min_chars:
-                chunks.append(chunk_text)
+            chunk_text_str = f"{split_on}".join(current_chunk)
+            if len(chunk_text_str) >= min_chars:
+                chunks.append(chunk_text_str)
             current_chunk = []
             current_len = 0
 
@@ -772,9 +1287,9 @@ def chunk_text(
 
     # Flush remaining
     if current_chunk:
-        chunk_text = f"{split_on}".join(current_chunk)
-        if len(chunk_text) >= min_chars:
-            chunks.append(chunk_text)
+        chunk_text_str = f"{split_on}".join(current_chunk)
+        if len(chunk_text_str) >= min_chars:
+            chunks.append(chunk_text_str)
 
     return chunks
 

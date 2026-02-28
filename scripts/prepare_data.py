@@ -24,6 +24,7 @@ Usage:
 """
 
 import argparse
+import hashlib
 import json
 import os
 import random
@@ -52,6 +53,7 @@ from scripts.filters import (
     apply_wiki_filters,
     chunk_text,
 )
+from scripts.gutenberg import stream_gutenberg as _stream_gutenberg_impl
 
 
 # =============================================================================
@@ -199,13 +201,33 @@ def save_checkpoint(checkpoint: Checkpoint, checkpoint_path: str):
 
 
 def stream_gutenberg(seed: int = 42) -> Iterator[str]:
-    """Gutenberg streaming disabled due to pg19 compatibility issues."""
-    return iter([])
+    """Stream text from Project Gutenberg (PG-19)."""
+    print("[gutenberg] Loading dataset...", flush=True)
+    count = 0
+    for text in _stream_gutenberg_impl(seed=seed, split="train"):
+        yield text
+        count += 1
+        if count == 1:
+            print(f"[gutenberg] First document yielded", flush=True)
+        elif count % 500 == 0:
+            print(f"[gutenberg] {count:,} docs", flush=True)
 
 
 def load_yaml(path: str) -> dict:
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
+
+
+def file_sha256(path: str, chunk_size: int = 1024 * 1024) -> str:
+    """Compute sha256 for a local file."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 @dataclass
@@ -373,6 +395,8 @@ def filter_and_transform_c4(
     chunks = chunk_text(text, filter_cfg.max_chunk_chars, filter_cfg.min_chunk_chars)
     if chunks:
         stats.record_pass()
+    else:
+        stats.record_reject("chunk_too_small")
     return chunks
 
 
@@ -404,6 +428,8 @@ def filter_and_transform_wiki(
     chunks = chunk_text(text, filter_cfg.max_chunk_chars, filter_cfg.min_chunk_chars)
     if chunks:
         stats.record_pass()
+    else:
+        stats.record_reject("chunk_too_small")
     return chunks
 
 
@@ -438,6 +464,8 @@ def filter_and_transform_gutenberg(
     chunks = chunk_text(text, filter_cfg.max_chunk_chars, filter_cfg.min_chunk_chars)
     if chunks:
         stats.record_pass()
+    else:
+        stats.record_reject("chunk_too_small")
     return chunks
 
 
@@ -631,9 +659,11 @@ def write_tokens_to_memmap(
     # Truncate to actual size
     mmap.flush()
     del mmap
-    mmap = np.memmap(output_path, dtype=dtype, mode="r+", shape=(position,))
-    mmap.flush()
-    del mmap
+    
+    # Actually truncate the file (memmap doesn't shrink files)
+    import os
+    bytes_per_token = np.dtype(dtype).itemsize
+    os.truncate(output_path, position * bytes_per_token)
 
     return position, was_interrupted
 
@@ -646,10 +676,63 @@ def process_and_tokenize(
     stats: dict,
     shuffle_buffer_size: int = 50000,
     seed: int = 42,
+    max_unk_ratio: float = 0.01,
 ) -> Iterator[List[int]]:
     """Process documents: filter, deduplicate, tokenize."""
     shuffle_buffer = ShuffleBuffer(shuffle_buffer_size, seed)
     dedup_rejects = 0
+    unk_rejects = 0
+    unk_id = tokenizer.unk_id()  # Usually 0
+    
+    # For periodic logging
+    last_log_time = time.time()
+    log_interval = 10  # Log every 10 seconds
+    docs_yielded = 0
+
+    def tokenize_and_filter(text: str) -> Optional[List[int]]:
+        """Tokenize and reject if too many unknown tokens."""
+        nonlocal unk_rejects
+        tokens = tokenizer.encode(text, out_type=int)
+        if not tokens:
+            return None
+        # Count unknown tokens
+        unk_count = sum(1 for t in tokens if t == unk_id)
+        if unk_count > 0 and unk_count / len(tokens) > max_unk_ratio:
+            unk_rejects += 1
+            return None
+        # Also reject if ANY unknown tokens in short docs
+        if len(tokens) < 200 and unk_count > 0:
+            unk_rejects += 1
+            return None
+        return tokens
+    
+    def log_filter_progress():
+        """Log current filter statistics."""
+        nonlocal last_log_time
+        now = time.time()
+        if now - last_log_time < log_interval:
+            return
+        last_log_time = now
+        
+        total_seen = stats["c4"].total_docs + stats["wiki"].total_docs + stats["gutenberg"].total_docs
+        c4_pass = stats["c4"].passed_docs
+        wiki_pass = stats["wiki"].passed_docs
+        gut_pass = stats["gutenberg"].passed_docs
+        total_pass = c4_pass + wiki_pass + gut_pass
+        
+        c4_rate = (c4_pass / stats["c4"].total_docs * 100) if stats["c4"].total_docs > 0 else 0
+        wiki_rate = (wiki_pass / stats["wiki"].total_docs * 100) if stats["wiki"].total_docs > 0 else 0
+        gut_rate = (gut_pass / stats["gutenberg"].total_docs * 100) if stats["gutenberg"].total_docs > 0 else 0
+        
+        print(
+            f"[filter] Seen {total_seen:,} docs | "
+            f"Passed: C4 {c4_pass:,} ({c4_rate:.1f}%), "
+            f"Wiki {wiki_pass:,} ({wiki_rate:.1f}%), "
+            f"Gut {gut_pass:,} ({gut_rate:.1f}%) | "
+            f"Yielded: {docs_yielded:,} | "
+            f"Dedup: {dedup_rejects:,} | UNK: {unk_rejects:,}",
+            flush=True
+        )
 
     for source_name, text in source_iter:
         if source_name == "c4":
@@ -660,6 +743,9 @@ def process_and_tokenize(
             chunks = filter_and_transform_gutenberg(text, filter_cfg, stats["gutenberg"])
         else:
             continue
+        
+        # Log progress periodically
+        log_filter_progress()
 
         for chunk in chunks:
             if deduplicator is not None and deduplicator.is_duplicate(chunk):
@@ -668,14 +754,19 @@ def process_and_tokenize(
 
             result = shuffle_buffer.add_and_maybe_yield(chunk)
             if result is not None:
-                tokens = tokenizer.encode(result, out_type=int)
-                yield tokens
+                tokens = tokenize_and_filter(result)
+                if tokens:
+                    docs_yielded += 1
+                    yield tokens
 
     for chunk in shuffle_buffer.flush():
-        tokens = tokenizer.encode(chunk, out_type=int)
-        yield tokens
+        tokens = tokenize_and_filter(chunk)
+        if tokens:
+            docs_yielded += 1
+            yield tokens
 
     stats["dedup_rejects"] = dedup_rejects
+    stats["unk_rejects"] = unk_rejects
 
 
 def main():
@@ -783,7 +874,18 @@ Examples:
         sp = spm.SentencePieceProcessor()
         sp.load(tokenizer_model)
         vocab_size = sp.vocab_size()
-        eos_token_id = 2
+        eos_token_id = sp.eos_id()
+        if eos_token_id is None or eos_token_id < 0:
+            raise SystemExit(
+                "Tokenizer must define eos_id. Re-train tokenizer with eos_id set."
+            )
+        tokenizer_special_ids = {
+            "unk": sp.unk_id(),
+            "bos": sp.bos_id(),
+            "eos": eos_token_id,
+            "pad": sp.pad_id(),
+        }
+        tokenizer_sha256 = file_sha256(tokenizer_model)
 
         dtype = np.uint16 if vocab_size < 65536 else np.uint32
         print(f"Vocab size: {vocab_size}, dtype: {dtype}")
@@ -960,6 +1062,10 @@ Examples:
             "wiki_weight": wiki_weight,
             "gutenberg_weight": gutenberg_weight,
             "seed": seed,
+            "tokenizer_model": os.path.abspath(tokenizer_model),
+            "tokenizer_sha256": tokenizer_sha256,
+            "tokenizer_vocab_size": vocab_size,
+            "tokenizer_special_ids": tokenizer_special_ids,
             "filter_config": {
                 "min_chars": filter_cfg.min_chars,
                 "max_chars": filter_cfg.max_chars,

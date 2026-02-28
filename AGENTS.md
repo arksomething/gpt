@@ -22,6 +22,36 @@ This repo trains a ~100M parameter Llama-style language model from scratch. The 
 | `configs/model_100m.yaml` | Model architecture config |
 | `configs/train.yaml` | Training hyperparameters |
 
+## Available Commands (pyproject.toml scripts)
+
+All commands are run with `uv run <command>`:
+
+| Command | Description |
+|---------|-------------|
+| `uv run train` | Train the model |
+| `uv run train --launch_screen` | Train in detached screen session |
+| `uv run train --smoke` | Quick smoke test |
+| `uv run train --resume_from <path>` | Resume from checkpoint |
+| `uv run eval` | Evaluate a trained model |
+| `uv run prepare-data` | Prepare tokenized training data |
+| `uv run train-tokenizer` | Train the SentencePiece tokenizer |
+| `uv run benchmark` | Benchmark throughput (tokens/sec) |
+| `uv run tokenizer-repl` | Interactive tokenizer REPL |
+| `uv run scan-bins` | Inspect .bin data files |
+| `uv run ls` | List project files/info |
+
+### Train command flags
+
+```
+--model_config PATH      Model config (default: configs/model_100m.yaml)
+--train_config PATH      Training config (default: configs/train.yaml)
+--resume_from PATH       Resume from checkpoint directory
+--resume_from_slot NAME  Resume from named checkpoint slot
+--smoke                  Run quick smoke test
+--launch_screen          Run training in detached screen session
+--screen_name NAME       Custom screen session name
+```
+
 ## Data
 
 Pre-tokenized data is hosted on HuggingFace:
@@ -41,27 +71,42 @@ huggingface-cli download ark296/gpt-training-data --repo-type dataset --local-di
 - Llama-style (RMSNorm, RoPE, SwiGLU)
 - See `configs/model_100m.yaml` for full config
 
-## Training
+## Quick Start
 
-Uses PyTorch with accelerate. Key training features:
-- Mixed precision (FP16/BF16)
-- Gradient accumulation
-- Checkpointing every N steps
-- Cosine learning rate schedule with warmup
-
-Run training:
 ```bash
-accelerate launch scripts/train.py \
-  --model_config configs/model_100m.yaml \
-  --train_config configs/train.yaml
+# Setup
+uv sync
+uv pip install torch --index-url https://download.pytorch.org/whl/cu124
+
+# Download pre-tokenized data
+huggingface-cli download ark296/gpt-training-data --repo-type dataset --local-dir ./data
+
+# Train (in screen for long runs)
+uv run train --launch_screen
+
+# Attach to watch training
+screen -r train
+
+# Detach: Ctrl+A, then D
 ```
 
-## Cloud Training Notes
+## Cloud Training (Google Colab)
 
-### Google Colab SSH Setup
-1. Enable SSH with `colab-ssh` package
-2. Use cloudflared tunnel for connection
-3. Data persists only during session - save checkpoints to HuggingFace
+```bash
+# Install uv
+curl -LsSf https://astral.sh/uv/install.sh | sh && source ~/.local/bin/env
+
+# Clone and setup
+git clone https://github.com/arksomething/gpt.git && cd gpt
+uv sync
+uv pip install torch --index-url https://download.pytorch.org/whl/cu124
+
+# Download data
+huggingface-cli download ark296/gpt-training-data --repo-type dataset --local-dir ./data
+
+# Train
+uv run train --launch_screen
+```
 
 ### GPU Performance Reference
 
@@ -75,24 +120,24 @@ accelerate launch scripts/train.py \
 
 ## Common Tasks
 
-### Resuming from checkpoint
+### Resume from checkpoint
 ```bash
-accelerate launch scripts/train.py \
-  --model_config configs/model_100m.yaml \
-  --train_config configs/train.yaml \
-  --resume runs/llama-100m/checkpoint-XXXXX
+uv run train --resume_from runs/llama-100m/checkpoint-XXXXX
 ```
 
-### Uploading results to HuggingFace
-```python
-from huggingface_hub import HfApi
-api = HfApi()
-api.upload_folder(folder_path="runs/llama-100m", repo_id="username/model-name", repo_type="model")
+### Run smoke test
+```bash
+uv run train --smoke
 ```
 
-### Running smoke test
+### Evaluate model
 ```bash
-accelerate launch scripts/train.py --smoke
+uv run eval
+```
+
+### View training log
+```bash
+less +F runs/llama-100m/train.log
 ```
 
 ## Dependencies

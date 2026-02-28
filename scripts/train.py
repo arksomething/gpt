@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -16,11 +17,244 @@ import yaml
 import sentencepiece as spm
 from accelerate import Accelerator
 from transformers import LlamaConfig, LlamaForCausalLM, get_cosine_schedule_with_warmup
+from huggingface_hub import HfApi, login as hf_login
 
 
 def load_yaml(path):
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
+
+
+def _file_sha256(path, chunk_size=1024 * 1024):
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _load_json_if_exists(path):
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _resolve_tokenizer_path(train_cfg):
+    checks_cfg = train_cfg.get("checks", {})
+    fixed_cfg = checks_cfg.get("fixed_prompt", {})
+    data_prep_cfg = train_cfg.get("data_prep", {})
+    eval_cfg = train_cfg.get("eval", {})
+    inference_cfg = train_cfg.get("inference", {})
+    candidates = [
+        fixed_cfg.get("tokenizer_model"),
+        data_prep_cfg.get("tokenizer_model"),
+        eval_cfg.get("tokenizer_model"),
+        inference_cfg.get("tokenizer"),
+    ]
+    for path in candidates:
+        if path:
+            return path
+    return None
+
+
+def _verify_tokenizer_compat(model_cfg, train_cfg, data_cfg):
+    tokenizer_path = _resolve_tokenizer_path(train_cfg)
+    if not tokenizer_path:
+        return
+    if not os.path.exists(tokenizer_path):
+        raise SystemExit(f"Tokenizer model not found: {tokenizer_path}")
+
+    sp = spm.SentencePieceProcessor()
+    sp.load(tokenizer_path)
+
+    mismatches = []
+    expected_vocab = int(model_cfg["vocab_size"])
+    actual_vocab = int(sp.vocab_size())
+    if actual_vocab != expected_vocab:
+        mismatches.append(
+            f"vocab_size mismatch: model={expected_vocab} tokenizer={actual_vocab}"
+        )
+
+    tokenizer_ids = {
+        "bos_token_id": sp.bos_id(),
+        "eos_token_id": sp.eos_id(),
+        "pad_token_id": sp.pad_id(),
+    }
+    for key, tok_id in tokenizer_ids.items():
+        model_id = model_cfg.get(key)
+        if model_id is None or tok_id is None:
+            continue
+        if int(model_id) != int(tok_id):
+            mismatches.append(f"{key} mismatch: model={model_id} tokenizer={tok_id}")
+
+    if mismatches:
+        details = "\n- ".join(mismatches)
+        raise SystemExit(
+            "Tokenizer/model config mismatch. Fix before training:\n"
+            f"- {details}"
+        )
+
+    train_bin = data_cfg.get("train_bin")
+    if not train_bin:
+        return
+    meta_path = os.path.join(os.path.dirname(train_bin) or ".", "data_meta.json")
+    meta = _load_json_if_exists(meta_path)
+    if not meta:
+        if data_cfg.get("hf_repo"):
+            print(
+                "[data] data_meta.json not found for train data. "
+                "If you use pre-tokenized HF data, ensure tokenizer matches that dataset."
+            )
+        return
+
+    meta_vocab = meta.get("tokenizer_vocab_size")
+    if meta_vocab is not None and int(meta_vocab) != actual_vocab:
+        raise SystemExit(
+            "Tokenizer/data mismatch: data_meta tokenizer_vocab_size "
+            f"is {meta_vocab}, current tokenizer vocab_size is {actual_vocab}."
+        )
+
+    meta_special = meta.get("tokenizer_special_ids") or {}
+    if isinstance(meta_special, dict):
+        key_pairs = (
+            ("bos_token_id", "bos"),
+            ("eos_token_id", "eos"),
+            ("pad_token_id", "pad"),
+        )
+        for model_key, meta_key in key_pairs:
+            if meta_key not in meta_special:
+                continue
+            meta_id = meta_special.get(meta_key)
+            model_id = model_cfg.get(model_key)
+            if meta_id is None or model_id is None:
+                continue
+            if int(meta_id) != int(model_id):
+                raise SystemExit(
+                    "Tokenizer/data mismatch: "
+                    f"data_meta {meta_key}={meta_id}, model {model_key}={model_id}."
+                )
+
+    meta_hash = meta.get("tokenizer_sha256")
+    if meta_hash:
+        current_hash = _file_sha256(tokenizer_path)
+        if current_hash != meta_hash:
+            raise SystemExit(
+                "Tokenizer file does not match data tokenization. "
+                f"Expected sha256={meta_hash}, got {current_hash}. "
+                "Re-run prepare-data with this tokenizer or switch to the matching tokenizer."
+            )
+    else:
+        print(
+            "[data] data_meta.json has no tokenizer_sha256; cannot fully verify "
+            "tokenizer/data consistency. Re-run prepare-data to add tokenizer fingerprinting."
+        )
+
+
+class CheckpointUploader:
+    """Uploads checkpoints to HuggingFace Hub."""
+    
+    def __init__(self, config: dict):
+        self.enabled = config.get("enabled", False)
+        self.repo_id = config.get("repo_id")
+        self.upload_interval = config.get("upload_interval", 1000)
+        self.delete_after_upload = config.get("delete_local_after_upload", False)
+        self.upload_optimizer = config.get("upload_optimizer", False)
+        self.token = config.get("token") or os.environ.get("HF_TOKEN")
+        self._api = None
+        self._last_upload_step = 0
+        
+        if self.enabled and not self.repo_id:
+            print("[checkpoint_upload] Warning: enabled but no repo_id set, disabling")
+            self.enabled = False
+        
+        if self.enabled and self.token:
+            try:
+                hf_login(token=self.token, add_to_git_credential=False)
+            except Exception as e:
+                print(f"[checkpoint_upload] Warning: HF login failed: {e}")
+    
+    @property
+    def api(self):
+        if self._api is None:
+            self._api = HfApi()
+            # Create repo if it doesn't exist
+            if self.enabled:
+                try:
+                    self._api.create_repo(self.repo_id, repo_type="model", exist_ok=True)
+                except Exception as e:
+                    print(f"[checkpoint_upload] Warning: Could not create repo: {e}")
+        return self._api
+    
+    def should_upload(self, step: int) -> bool:
+        """Check if we should upload at this step."""
+        if not self.enabled:
+            return False
+        if step - self._last_upload_step >= self.upload_interval:
+            return True
+        return False
+    
+    def upload(self, checkpoint_dir: str, step: int, is_final: bool = False):
+        """Upload checkpoint to HuggingFace Hub."""
+        if not self.enabled:
+            return
+        
+        try:
+            folder_name = "final" if is_final else f"step_{step:07d}"
+            
+            # Determine which files to upload
+            files_to_upload = ["model.pt", "model.safetensors"]
+            if self.upload_optimizer:
+                files_to_upload.extend(["optimizer.bin", "scheduler.bin", "random_states_0.pkl"])
+            
+            uploaded_files = []
+            for filename in files_to_upload:
+                filepath = os.path.join(checkpoint_dir, filename)
+                if os.path.exists(filepath):
+                    self.api.upload_file(
+                        path_or_fileobj=filepath,
+                        path_in_repo=f"{folder_name}/{filename}",
+                        repo_id=self.repo_id,
+                        repo_type="model",
+                    )
+                    uploaded_files.append(filename)
+            
+            print(f"[checkpoint_upload] Uploaded {folder_name} to {self.repo_id} ({', '.join(uploaded_files)})")
+            self._last_upload_step = step
+            
+            # Delete local checkpoint if configured
+            if self.delete_after_upload and not is_final:
+                shutil.rmtree(checkpoint_dir)
+                print(f"[checkpoint_upload] Deleted local checkpoint {checkpoint_dir}")
+                
+        except Exception as e:
+            print(f"[checkpoint_upload] Error uploading checkpoint: {e}")
+    
+    def upload_logs(self, output_dir: str):
+        """Upload training logs to HuggingFace Hub."""
+        if not self.enabled:
+            return
+        
+        try:
+            log_files = ["train.log", "fixed_prompt_samples.txt"]
+            for filename in log_files:
+                filepath = os.path.join(output_dir, filename)
+                if os.path.exists(filepath):
+                    self.api.upload_file(
+                        path_or_fileobj=filepath,
+                        path_in_repo=filename,
+                        repo_id=self.repo_id,
+                        repo_type="model",
+                    )
+            print(f"[checkpoint_upload] Uploaded logs to {self.repo_id}")
+        except Exception as e:
+            print(f"[checkpoint_upload] Error uploading logs: {e}")
 
 
 class Tee:
@@ -110,22 +344,209 @@ def maybe_launch_screen(enabled, session_name):
     return False
 
 
-def load_memmap(path, dtype):
+def load_memmap(path, dtype, hf_repo=None):
+    """Load a memmap file, optionally downloading from HuggingFace first."""
+    if not os.path.exists(path) and hf_repo:
+        # Download from HuggingFace if not present locally
+        from huggingface_hub import hf_hub_download
+        filename = os.path.basename(path)
+        try:
+            local_path = hf_hub_download(
+                repo_id=hf_repo,
+                filename=filename,
+                repo_type="dataset",
+                local_dir=os.path.dirname(path) or ".",
+            )
+            path = local_path
+            print(f"[data] Downloaded missing file {filename} from {hf_repo}")
+        except Exception as e:
+            print(f"[data] Warning: Could not download from HF: {e}, trying local path")
+    
     if not os.path.exists(path):
         raise SystemExit(f"Missing data file: {path}")
     return np.memmap(path, dtype=dtype, mode="r")
 
 
 def get_batch(data, batch_size, block_size, rng, device):
-    max_idx = len(data) - block_size - 1
+    # HF CausalLM loss already shifts labels internally (token < n predicts n),
+    # so labels must be aligned with input_ids, not pre-shifted.
+    max_idx = len(data) - block_size + 1
     if max_idx <= 0:
         raise SystemExit("Data file too small for block_size.")
     idx = rng.integers(0, max_idx, size=batch_size)
     x = np.stack([data[i : i + block_size] for i in idx])
-    y = np.stack([data[i + 1 : i + block_size + 1] for i in idx])
     x = torch.from_numpy(x).long().to(device, non_blocking=True)
-    y = torch.from_numpy(y).long().to(device, non_blocking=True)
+    y = x.clone()
     return x, y
+
+
+class StreamingDataLoader:
+    """Streams tokenized data from HuggingFace with prefetching."""
+    
+    def __init__(
+        self,
+        hf_repo: str,
+        split: str,
+        block_size: int,
+        batch_size: int,
+        device,
+        buffer_size: int = 10000,
+        prefetch_batches: int = 10,
+        seed: int = 1337,
+    ):
+        from datasets import load_dataset
+        from threading import Thread
+        from queue import Queue
+        
+        self.block_size = block_size
+        self.batch_size = batch_size
+        self.device = device
+        self.buffer_size = buffer_size
+        self.prefetch_batches = prefetch_batches
+        self.rng = np.random.default_rng(seed)
+        
+        # Load streaming dataset
+        print(f"[streaming] Loading {hf_repo} split={split} (streaming mode)")
+        self.dataset = load_dataset(
+            hf_repo,
+            split=split,
+            streaming=True,
+        ).shuffle(seed=seed, buffer_size=buffer_size)
+        
+        # Token buffer - accumulates tokens from streamed examples
+        self._token_buffer = np.array([], dtype=np.uint16)
+        self._dataset_iter = iter(self.dataset)
+        self._min_buffer_tokens = block_size * batch_size * 4  # Keep buffer well-stocked
+        
+        # Prefetch queue
+        self._batch_queue = Queue(maxsize=prefetch_batches)
+        self._stop_prefetch = False
+        self._prefetch_thread = Thread(target=self._prefetch_worker, daemon=True)
+        self._prefetch_thread.start()
+        
+        print(f"[streaming] Started with buffer_size={buffer_size}, prefetch={prefetch_batches}")
+    
+    def _fill_buffer(self):
+        """Fill token buffer from streaming dataset."""
+        tokens_needed = self._min_buffer_tokens - len(self._token_buffer)
+        if tokens_needed <= 0:
+            return
+        
+        new_tokens = []
+        tokens_collected = 0
+        
+        while tokens_collected < tokens_needed:
+            try:
+                example = next(self._dataset_iter)
+                # Expect pre-tokenized data with 'input_ids' or 'tokens' field
+                if "input_ids" in example:
+                    toks = example["input_ids"]
+                elif "tokens" in example:
+                    toks = example["tokens"]
+                else:
+                    # Skip examples without tokens
+                    continue
+                
+                if isinstance(toks, list):
+                    new_tokens.extend(toks)
+                    tokens_collected += len(toks)
+                    
+            except StopIteration:
+                # Dataset exhausted, restart
+                self._dataset_iter = iter(self.dataset)
+        
+        if new_tokens:
+            self._token_buffer = np.concatenate([
+                self._token_buffer,
+                np.array(new_tokens, dtype=np.uint16)
+            ])
+    
+    def _get_batch_from_buffer(self):
+        """Extract a batch from the token buffer."""
+        self._fill_buffer()
+        
+        # HF CausalLM loss shifts labels internally, so no manual +1 offset.
+        batch_tokens = self.block_size
+        total_needed = self.batch_size * batch_tokens
+        
+        if len(self._token_buffer) < total_needed:
+            raise RuntimeError("Token buffer too small - this shouldn't happen")
+        
+        # Random starting positions within buffer
+        max_start = len(self._token_buffer) - batch_tokens + 1
+        starts = self.rng.integers(0, max_start, size=self.batch_size)
+        
+        x_list = []
+        for start in starts:
+            x_list.append(self._token_buffer[start:start + self.block_size])
+        
+        x = torch.from_numpy(np.stack(x_list)).long().to(self.device, non_blocking=True)
+        y = x.clone()
+        
+        # Trim buffer occasionally to prevent unbounded growth
+        if len(self._token_buffer) > self._min_buffer_tokens * 2:
+            self._token_buffer = self._token_buffer[-self._min_buffer_tokens:]
+        
+        return x, y
+    
+    def _prefetch_worker(self):
+        """Background thread that prefetches batches."""
+        while not self._stop_prefetch:
+            try:
+                batch = self._get_batch_from_buffer()
+                self._batch_queue.put(batch, timeout=1.0)
+            except Exception as e:
+                if not self._stop_prefetch:
+                    print(f"[streaming] Prefetch error: {e}")
+                    import time
+                    time.sleep(0.1)
+    
+    def get_batch(self):
+        """Get next batch (from prefetch queue)."""
+        return self._batch_queue.get(timeout=30.0)
+    
+    def stop(self):
+        """Stop prefetch thread."""
+        self._stop_prefetch = True
+        self._prefetch_thread.join(timeout=2.0)
+
+
+def create_data_loader(data_cfg, batch_size, block_size, device, seed):
+    """Create either memmap or streaming data loader based on config."""
+    streaming_cfg = data_cfg.get("streaming", {})
+    
+    if streaming_cfg.get("enabled", False):
+        hf_repo = streaming_cfg.get("hf_repo")
+        if not hf_repo:
+            raise SystemExit("streaming.hf_repo required when streaming.enabled=true")
+        
+        train_loader = StreamingDataLoader(
+            hf_repo=hf_repo,
+            split=streaming_cfg.get("train_split", "train"),
+            block_size=block_size,
+            batch_size=batch_size,
+            device=device,
+            buffer_size=streaming_cfg.get("buffer_size", 10000),
+            prefetch_batches=streaming_cfg.get("prefetch_batches", 10),
+            seed=seed,
+        )
+        
+        # For validation, still use local or download
+        # (val is small, streaming overhead not worth it)
+        val_data = None
+        if data_cfg.get("val_bin"):
+            dtype = np.dtype(data_cfg["dtype"])
+            hf_data_repo = data_cfg.get("hf_repo")
+            val_data = load_memmap(data_cfg["val_bin"], dtype, hf_repo=hf_data_repo)
+        
+        return {"mode": "streaming", "train": train_loader, "val": val_data}
+    else:
+        # Original memmap mode
+        dtype = np.dtype(data_cfg["dtype"])
+        hf_data_repo = data_cfg.get("hf_repo")
+        train_data = load_memmap(data_cfg["train_bin"], dtype, hf_repo=hf_data_repo)
+        val_data = load_memmap(data_cfg["val_bin"], dtype, hf_repo=hf_data_repo)
+        return {"mode": "memmap", "train": train_data, "val": val_data}
 
 
 @torch.no_grad()
@@ -771,9 +1192,11 @@ def main():
     logging_cfg = train_cfg.get("logging", {})
     runtime_cfg = train_cfg.get("runtime_control", {})
     checkpoint_cfg = train_cfg.get("checkpoint_slots", {})
+    checkpoint_upload_cfg = train_cfg.get("checkpoint_upload", {})
     overfit_cfg = checks_cfg.get("overfit_microset", {})
     fixed_prompt_cfg = checks_cfg.setdefault("fixed_prompt", {})
 
+    _verify_tokenizer_compat(model_cfg, train_cfg, data_cfg)
     _normalize_runtime_values(optim_cfg)
 
     set_seed(optim_cfg["seed"])
@@ -788,9 +1211,17 @@ def main():
     )
     device = accelerator.device
 
-    dtype = np.dtype(data_cfg["dtype"])
-    train_data = load_memmap(data_cfg["train_bin"], dtype)
-    val_data = load_memmap(data_cfg["val_bin"], dtype)
+    # Create data loader (memmap or streaming)
+    data_loader = create_data_loader(
+        data_cfg,
+        batch_size=optim_cfg["micro_batch_size"],
+        block_size=data_cfg["block_size"],
+        device=device,
+        seed=optim_cfg["seed"],
+    )
+    streaming_mode = data_loader["mode"] == "streaming"
+    train_data = data_loader["train"]  # Either np.memmap or StreamingDataLoader
+    val_data = data_loader["val"]  # np.memmap (or None)
 
     config = LlamaConfig(
         vocab_size=model_cfg["vocab_size"],
@@ -862,6 +1293,7 @@ def main():
     manifest = _load_checkpoint_manifest(output_dir)
     best_slots = max(0, int(checkpoint_cfg.get("best", 2)))
     good_slots = list(checkpoint_cfg.get("good", ["good_1", "good_2"]) or [])
+    checkpoint_uploader = CheckpointUploader(checkpoint_upload_cfg) if accelerator.is_main_process else None
 
     model_prepared = False
     if overfit_cfg.get("enabled", False) and (not args.smoke or overfit_cfg.get("run_on_smoke", False)):
@@ -977,7 +1409,11 @@ def main():
         model.train()
         step_loss = 0.0
         for _ in range(grad_accum):
-            x, y = get_batch(train_data, micro_batch, block_size, rng, device)
+            # Get batch from streaming or memmap loader
+            if streaming_mode:
+                x, y = train_data.get_batch()
+            else:
+                x, y = get_batch(train_data, micro_batch, block_size, rng, device)
             with accelerator.accumulate(model):
                 outputs = model(input_ids=x, labels=y)
                 loss = outputs.loss
@@ -1065,6 +1501,11 @@ def main():
                 if best_slots > 0:
                     _update_best_slots(manifest, ckpt_dir_name, last_val_loss, best_slots)
                 _save_checkpoint_manifest(output_dir, manifest)
+                
+                # Upload checkpoint to HuggingFace if configured
+                if checkpoint_uploader and checkpoint_uploader.should_upload(step):
+                    checkpoint_uploader.upload(ckpt_dir, step)
+                
                 rotate_checkpoints(
                     output_dir,
                     optim_cfg["checkpoint_limit"],
@@ -1081,6 +1522,16 @@ def main():
         unwrapped = accelerator.unwrap_model(model)
         torch.save(unwrapped.state_dict(), os.path.join(final_dir, "model.pt"))
         print(f"Saved final checkpoint to {final_dir}")
+        
+        # Upload final checkpoint and logs to HuggingFace
+        if checkpoint_uploader and checkpoint_uploader.enabled:
+            checkpoint_uploader.upload(final_dir, step, is_final=True)
+            checkpoint_uploader.upload_logs(output_dir)
+        
+        # Stop streaming data loader if active
+        if streaming_mode:
+            train_data.stop()
+        
         cleanup_logging()
 
 

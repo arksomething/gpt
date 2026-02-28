@@ -24,12 +24,19 @@ from scripts.filters import (
     apply_wiki_filters,
     apply_gutenberg_filters,
 )
+from scripts.gutenberg import stream_gutenberg as _stream_gutenberg_impl
 
 
 def stream_gutenberg(seed: int = 42):
-    """Gutenberg streaming disabled due to pg19 compatibility issues."""
-    # Return empty iterator - effectively disables Gutenberg
-    return iter([])
+    """Stream text from Project Gutenberg (PG-19)."""
+    count = 0
+    for text in _stream_gutenberg_impl(seed=seed, split="train"):
+        yield text
+        count += 1
+        if count == 1:
+            print("[tokenizer:gutenberg] First document yielded", flush=True)
+        elif count % 500 == 0:
+            print(f"[tokenizer:gutenberg] {count:,} docs", flush=True)
 
 
 def load_yaml(path: str) -> dict:

@@ -4,6 +4,15 @@ data:
   block_size: 2048
   dtype: uint16
   vocab_size: 32000
+  hf_repo: null  # Optional HF pre-tokenized dataset; must match tokenizer exactly
+  
+  # Streaming mode - load data directly from HuggingFace without storing locally
+  streaming:
+    enabled: false  # Set to true to enable streaming
+    hf_repo: ark296/gpt-training-data-tokenized  # HF dataset with pre-tokenized data
+    train_split: train
+    buffer_size: 10000  # Shuffle buffer size
+    prefetch_batches: 10  # Batches to prefetch in background
 
 data_prep:
   tokenizer_model: tokenizer/spm.model
@@ -12,10 +21,10 @@ data_prep:
   val_tokens: 20000000
   
   # Source weights (should sum to 1.0)
-  # Note: Gutenberg disabled due to pg19 dataset compatibility issues
-  c4_weight: 0.40
-  wiki_weight: 0.60
-  gutenberg_weight: 0.0
+  # Gutenberg provides high-quality literary prose
+  c4_weight: 0.35
+  wiki_weight: 0.45
+  gutenberg_weight: 0.20
   
   shuffle_buffer: 1000
   seed: 1337
@@ -37,7 +46,7 @@ data_prep:
   c4_max_entropy: 5.6
   
   # Wikipedia-specific (W1)
-  wiki_max_list_ratio: 0.30
+  wiki_max_list_ratio: 0.20
   
   # Gutenberg-specific (GUT2)
   gutenberg_filter_poetry: false
@@ -62,6 +71,17 @@ eval:
   top_p: 0.9
   top_k: 50
   repetition_penalty: 1.1
+
+inference:
+  checkpoint: runs/llama-100m/final
+  model_config: configs/model_100m.yaml
+  tokenizer: tokenizer/spm.model
+  max_tokens: 100
+  temperature: 0.7
+  top_p: 0.9
+  top_k: 40
+  repetition_penalty: 1.1  # 1.0=none, 1.05-1.2=gentle
+  device: auto  # auto, cuda, or cpu
 
 tokenizer_training:
   output_dir: tokenizer
@@ -89,11 +109,18 @@ training:
   max_grad_norm: 1.0
   gradient_checkpointing: true
   allow_tf32: true
-  checkpoint_limit: 3
+  checkpoint_limit: 1  # Keep only 1 local checkpoint to save disk space
 
 checkpoint_slots:
   best: 1
   good: ["good"]
+
+checkpoint_upload:
+  enabled: false  # Set to true to enable
+  repo_id: ark296/llama-100m-checkpoints
+  upload_interval: 1000  # Upload every N steps
+  delete_local_after_upload: true  # Free disk space
+  upload_optimizer: false  # Skip optimizer to save space
 
 logging:
   enabled: true
@@ -161,7 +188,7 @@ checks:
       - "Once upon a time,"
       - "The capital of France is"
       - "To solve this problem,"
-    deterministic: true  # greedy decoding for clearer signal
+    deterministic: false  # use sampling for more realistic outputs
     max_new_tokens: 120
     min_new_tokens: 16
     temperature: 1.0
