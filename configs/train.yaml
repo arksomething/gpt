@@ -103,7 +103,7 @@ training:
   max_steps: 7630
   eval_interval: 200
   log_interval: 50
-  save_interval: 500
+  save_interval: 1000  # align with upload cadence to avoid extra local checkpoints
   output_dir: runs/llama-100m-v2
   precision: bf16
   max_grad_norm: 1.0
@@ -112,12 +112,12 @@ training:
   checkpoint_limit: 1  # Keep only 1 local checkpoint to save disk space
 
 checkpoint_slots:
-  best: 1
-  good: ["good"]
+  best: 0
+  good: []
 
 checkpoint_upload:
-  enabled: false  # Set to true to enable
-  repo_id: ark296/llama-100m-checkpoints
+  enabled: true  # Requires HF_TOKEN or huggingface-cli login
+  repo_id: ark296/llama-100m-v2-checkpoints
   upload_interval: 1000  # Upload every N steps
   delete_local_after_upload: true  # Free disk space
   upload_optimizer: false  # Skip optimizer to save space
