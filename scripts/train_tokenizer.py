@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Train a SentencePiece BPE tokenizer from C4, Wikipedia, and Project Gutenberg.
+Train a SentencePiece BPE tokenizer from C4, Wikipedia, and FineWeb.
 
-Streams and filters text from all three sources, then trains a BPE tokenizer.
+Streams and filters text from three sources, then trains a BPE tokenizer.
 """
 
 import argparse
@@ -22,21 +22,36 @@ from tqdm import tqdm
 
 from scripts.filters import (
     apply_wiki_filters,
-    apply_gutenberg_filters,
 )
-from scripts.gutenberg import stream_gutenberg as _stream_gutenberg_impl
 
 
-def stream_gutenberg(seed: int = 42):
-    """Stream text from Project Gutenberg (PG-19)."""
-    count = 0
-    for text in _stream_gutenberg_impl(seed=seed, split="train"):
-        yield text
-        count += 1
-        if count == 1:
-            print("[tokenizer:gutenberg] First document yielded", flush=True)
-        elif count % 500 == 0:
-            print(f"[tokenizer:gutenberg] {count:,} docs", flush=True)
+def stream_fineweb(seed: int = 42) -> Iterator[str]:
+    """Stream text from FineWeb-Edu."""
+    repo = os.environ.get("FINEWEB_REPO", "HuggingFaceFW/fineweb-edu")
+    config = os.environ.get("FINEWEB_CONFIG", "sample-10BT")
+    split = os.environ.get("FINEWEB_SPLIT", "train")
+    text_field = os.environ.get("FINEWEB_TEXT_FIELD", "text")
+    shuffle_buffer = int(os.environ.get("FINEWEB_SHUFFLE_BUFFER", "10000") or 10000)
+
+    if config:
+        ds = load_dataset(
+            repo,
+            config,
+            split=split,
+            streaming=True,
+        )
+    else:
+        ds = load_dataset(
+            repo,
+            split=split,
+            streaming=True,
+        )
+    if shuffle_buffer > 1:
+        ds = ds.shuffle(seed=seed, buffer_size=shuffle_buffer)
+    for example in ds:
+        text = example.get(text_field) if isinstance(example, dict) else None
+        if isinstance(text, str) and text.strip():
+            yield text
 
 
 def load_yaml(path: str) -> dict:
@@ -90,10 +105,6 @@ def filter_text_basic(
     if len(text) > max_chars:
         text = text[:max_chars]
 
-    # For Gutenberg, strip the boilerplate header/footer
-    if source == "gutenberg":
-        text, _, _ = apply_gutenberg_filters(text)
-    
     # For Wikipedia, strip markup but don't filter
     if source == "wiki":
         text, _, _ = apply_wiki_filters(text)
@@ -108,10 +119,10 @@ def filter_text_basic(
 def interleave_and_filter(
     c4_iter: Iterator[str],
     wiki_iter: Iterator[str],
-    gutenberg_iter: Iterator[str],
+    fineweb_iter: Iterator[str],
     c4_weight: float,
     wiki_weight: float,
-    gutenberg_weight: float,
+    fineweb_weight: float,
     min_chars: int,
     max_chars: int,
     seed: int = 42,
@@ -123,19 +134,21 @@ def interleave_and_filter(
     rng = random.Random(seed)
 
     # Normalize weights
-    total = c4_weight + wiki_weight + gutenberg_weight
+    total = c4_weight + wiki_weight + fineweb_weight
+    if total <= 0:
+        raise ValueError("At least one source weight must be > 0.")
     c4_norm = c4_weight / total
     wiki_norm = wiki_weight / total
-    gutenberg_norm = gutenberg_weight / total
+    fineweb_norm = fineweb_weight / total
 
-    c4_exhausted = False
-    wiki_exhausted = False
-    gutenberg_exhausted = False
+    c4_exhausted = c4_weight <= 0
+    wiki_exhausted = wiki_weight <= 0
+    fineweb_exhausted = fineweb_weight <= 0
     
     docs_yielded = 0
 
     while True:
-        if c4_exhausted and wiki_exhausted and gutenberg_exhausted:
+        if c4_exhausted and wiki_exhausted and fineweb_exhausted:
             break
 
         # Calculate available weight
@@ -144,8 +157,8 @@ def interleave_and_filter(
             available_weight += c4_norm
         if not wiki_exhausted:
             available_weight += wiki_norm
-        if not gutenberg_exhausted:
-            available_weight += gutenberg_norm
+        if not fineweb_exhausted:
+            available_weight += fineweb_norm
 
         if available_weight == 0:
             break
@@ -163,8 +176,8 @@ def interleave_and_filter(
             cumulative += wiki_norm / available_weight
             if roll < cumulative:
                 selected = "wiki"
-        if selected is None and not gutenberg_exhausted:
-            selected = "gutenberg"
+        if selected is None and not fineweb_exhausted:
+            selected = "fineweb"
 
         # Get next item
         try:
@@ -180,9 +193,9 @@ def interleave_and_filter(
                 if filtered:
                     docs_yielded += 1
                     yield filtered
-            elif selected == "gutenberg":
-                text = next(gutenberg_iter)
-                filtered = filter_text_basic(text, "gutenberg", min_chars, max_chars)
+            elif selected == "fineweb":
+                text = next(fineweb_iter)
+                filtered = filter_text_basic(text, "fineweb", min_chars, max_chars)
                 if filtered:
                     docs_yielded += 1
                     yield filtered
@@ -193,9 +206,9 @@ def interleave_and_filter(
             elif selected == "wiki":
                 wiki_exhausted = True
                 print(f"[tokenizer] Wikipedia source exhausted after {docs_yielded} total docs")
-            elif selected == "gutenberg":
-                gutenberg_exhausted = True
-                print(f"[tokenizer] Gutenberg source exhausted after {docs_yielded} total docs")
+            elif selected == "fineweb":
+                fineweb_exhausted = True
+                print(f"[tokenizer] FineWeb source exhausted after {docs_yielded} total docs")
 
 
 def collect_text_to_file(
@@ -304,7 +317,13 @@ def main():
     parser.add_argument("--vocab_size", type=int, default=None, help="Vocabulary size")
     parser.add_argument("--c4_weight", type=float, default=None, help="C4 weight")
     parser.add_argument("--wiki_weight", type=float, default=None, help="Wikipedia weight")
-    parser.add_argument("--gutenberg_weight", type=float, default=None, help="Gutenberg weight")
+    parser.add_argument("--fineweb_weight", type=float, default=None, help="FineWeb weight")
+    parser.add_argument(
+        "--gutenberg_weight",
+        type=float,
+        default=None,
+        help="Deprecated alias for --fineweb_weight.",
+    )
     parser.add_argument("--min_chars", type=int, default=None, help="Min chars per document")
     parser.add_argument("--max_chars", type=int, default=None, help="Max chars for training")
     parser.add_argument("--shuffle_buffer", type=int, default=None, help="Shuffle buffer size")
@@ -321,9 +340,21 @@ def main():
     vocab_size = args.vocab_size or tok_cfg.get("vocab_size", 32000)
     c4_weight = args.c4_weight if args.c4_weight is not None else data_prep_cfg.get("c4_weight", 0.30)
     wiki_weight = args.wiki_weight if args.wiki_weight is not None else data_prep_cfg.get("wiki_weight", 0.45)
-    gutenberg_weight = (
-        args.gutenberg_weight if args.gutenberg_weight is not None else data_prep_cfg.get("gutenberg_weight", 0.25)
+    fineweb_weight = (
+        args.fineweb_weight if args.fineweb_weight is not None else data_prep_cfg.get("fineweb_weight")
     )
+    if fineweb_weight is None:
+        fineweb_weight = (
+            args.gutenberg_weight
+            if args.gutenberg_weight is not None
+            else data_prep_cfg.get("gutenberg_weight", 0.0)
+        )
+        if args.gutenberg_weight is not None:
+            print("[tokenizer] --gutenberg_weight is deprecated; treating it as --fineweb_weight.")
+    elif args.gutenberg_weight is not None:
+        print("[tokenizer] --gutenberg_weight ignored because --fineweb_weight is set.")
+    if c4_weight <= 0 and wiki_weight <= 0 and fineweb_weight <= 0:
+        raise SystemExit("At least one of c4_weight, wiki_weight, or fineweb_weight must be > 0.")
     min_chars = args.min_chars or tok_cfg.get("min_chars", 200)
     max_chars = args.max_chars or tok_cfg.get("max_chars", 50_000_000)
     seed = args.seed if args.seed is not None else tok_cfg.get("seed", 1337)
@@ -332,7 +363,7 @@ def main():
     print("=" * 50)
     print(f"Output directory: {output_dir}")
     print(f"Vocabulary size: {vocab_size}")
-    print(f"Source weights: C4={c4_weight}, Wiki={wiki_weight}, Gutenberg={gutenberg_weight}")
+    print(f"Source weights: C4={c4_weight}, Wiki={wiki_weight}, FineWeb={fineweb_weight}")
     print(f"Max chars for training: {max_chars:,}")
     print(f"Seed: {seed}")
     print()
@@ -341,16 +372,16 @@ def main():
     print("Initializing data streams...")
     c4_iter = stream_c4(seed)
     wiki_iter = stream_wikipedia(seed)
-    gutenberg_iter = stream_gutenberg(seed)
+    fineweb_iter = stream_fineweb(seed) if fineweb_weight > 0 else iter(())
 
     # Create interleaved and filtered iterator
     text_iter = interleave_and_filter(
         c4_iter,
         wiki_iter,
-        gutenberg_iter,
+        fineweb_iter,
         c4_weight,
         wiki_weight,
-        gutenberg_weight,
+        fineweb_weight,
         min_chars=min_chars,
         max_chars=100000,  # Per-document max
         seed=seed,
@@ -386,7 +417,8 @@ def main():
         "vocab_size": vocab_size,
         "c4_weight": c4_weight,
         "wiki_weight": wiki_weight,
-        "gutenberg_weight": gutenberg_weight,
+        "fineweb_weight": fineweb_weight,
+        "gutenberg_weight": fineweb_weight,
         "min_chars": min_chars,
         "max_chars": max_chars,
         "seed": seed,

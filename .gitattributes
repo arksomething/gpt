@@ -1,0 +1,10 @@
+# Keep generated training artifacts out of source archives.
+runs/** export-ignore
+data/** export-ignore
+tokenizer/archive/** export-ignore
+*.pt export-ignore
+*.ckpt export-ignore
+*.safetensors export-ignore
+*.bin export-ignore
+*.npy export-ignore
+*.npz export-ignore

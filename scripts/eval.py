@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 import argparse
+import hashlib
+import json
 import math
 import os
 
@@ -7,12 +9,118 @@ import numpy as np
 import torch
 import yaml
 import sentencepiece as spm
+from huggingface_hub import hf_hub_download
 from transformers import LlamaConfig, LlamaForCausalLM
 
 
 def load_yaml(path):
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
+
+
+def _file_sha256(path, chunk_size=1024 * 1024):
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _load_json_if_exists(path):
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _find_artifact_manifest_path(checkpoint_dir):
+    parent = os.path.dirname(os.path.normpath(checkpoint_dir))
+    candidates = [
+        os.path.join(checkpoint_dir, "artifacts_manifest.json"),
+        os.path.join(checkpoint_dir, "artifacts", "artifacts_manifest.json"),
+        os.path.join(parent, "artifacts_manifest.json"),
+        os.path.join(parent, "artifacts", "artifacts_manifest.json"),
+    ]
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def _load_artifact_manifest(checkpoint_dir, repo_id):
+    local_manifest = _find_artifact_manifest_path(checkpoint_dir)
+    if local_manifest:
+        return _load_json_if_exists(local_manifest), local_manifest
+    if not repo_id:
+        return None, None
+
+    cache_dir = os.path.join(os.path.dirname(os.path.normpath(checkpoint_dir)), ".hf_artifacts")
+    try:
+        manifest_path = hf_hub_download(
+            repo_id=repo_id,
+            filename="artifacts/artifacts_manifest.json",
+            repo_type="model",
+            local_dir=cache_dir,
+        )
+    except Exception:
+        return None, None
+    return _load_json_if_exists(manifest_path), manifest_path
+
+
+def _validate_artifacts_or_die(artifact_manifest, tokenizer_model_path, model_config_path, data_cfg):
+    errors = []
+    tokenizer_info = (artifact_manifest.get("tokenizer") or {})
+    expected_tokenizer_sha = tokenizer_info.get("sha256")
+    if expected_tokenizer_sha:
+        if not os.path.exists(tokenizer_model_path):
+            errors.append(f"tokenizer model missing at '{tokenizer_model_path}'")
+        else:
+            actual_tokenizer_sha = _file_sha256(tokenizer_model_path)
+            if actual_tokenizer_sha != expected_tokenizer_sha:
+                errors.append(
+                    "tokenizer sha256 mismatch: "
+                    f"expected={expected_tokenizer_sha}, got={actual_tokenizer_sha}"
+                )
+
+    model_cfg_info = artifact_manifest.get("model_config") or {}
+    expected_model_cfg_sha = model_cfg_info.get("sha256")
+    if expected_model_cfg_sha:
+        if not os.path.exists(model_config_path):
+            errors.append(f"model config missing at '{model_config_path}'")
+        else:
+            actual_model_cfg_sha = _file_sha256(model_config_path)
+            if actual_model_cfg_sha != expected_model_cfg_sha:
+                errors.append(
+                    "model config sha256 mismatch: "
+                    f"expected={expected_model_cfg_sha}, got={actual_model_cfg_sha}"
+                )
+
+    data_meta_expected = (((artifact_manifest.get("data") or {}).get("data_meta") or {}).get("tokenizer_sha256"))
+    val_bin = data_cfg.get("val_bin")
+    data_meta_path = os.path.join(os.path.dirname(val_bin) or ".", "data_meta.json") if val_bin else None
+    data_meta = _load_json_if_exists(data_meta_path)
+    if data_meta_expected and isinstance(data_meta, dict):
+        local_data_tokenizer_sha = data_meta.get("tokenizer_sha256")
+        if local_data_tokenizer_sha and local_data_tokenizer_sha != data_meta_expected:
+            errors.append(
+                "data_meta tokenizer sha256 mismatch: "
+                f"expected={data_meta_expected}, got={local_data_tokenizer_sha}"
+            )
+
+    if errors:
+        detail = "\n- ".join(errors)
+        raise SystemExit(
+            "Artifact validation failed. Refusing to evaluate with mismatched artifacts.\n"
+            f"- {detail}\n"
+            "Use the checkpoint's matching tokenizer/config, or rerun with --skip_artifact_validation "
+            "only if you intentionally accept invalid comparisons."
+        )
 
 
 def load_memmap(path, dtype):
@@ -22,13 +130,13 @@ def load_memmap(path, dtype):
 
 
 def get_batch(data, batch_size, block_size, rng, device):
-    max_idx = len(data) - block_size - 1
+    max_idx = len(data) - block_size + 1
+    if max_idx <= 0:
+        raise SystemExit("Validation data file too small for block_size.")
     idx = rng.integers(0, max_idx, size=batch_size)
     x = np.stack([data[i : i + block_size] for i in idx])
-    y = np.stack([data[i + 1 : i + block_size + 1] for i in idx])
     x = torch.from_numpy(x).long().to(device, non_blocking=True)
-    y = torch.from_numpy(y).long().to(device, non_blocking=True)
-    return x, y
+    return x, x
 
 
 @torch.no_grad()
@@ -40,7 +148,7 @@ def eval_loss(model, data, batch_size, block_size, device, batches, seed):
         x, y = get_batch(data, batch_size, block_size, rng, device)
         outputs = model(input_ids=x, labels=y)
         losses.append(outputs.loss.detach().cpu().item())
-    return sum(losses) / len(losses)
+    return sum(losses) / len(losses) if losses else float("nan")
 
 
 def _truncate_at_eos(token_ids, eos_id):
@@ -108,6 +216,12 @@ def main():
     parser.add_argument("--top_p", type=float, default=None)
     parser.add_argument("--top_k", type=int, default=None)
     parser.add_argument("--repetition_penalty", type=float, default=None)
+    parser.add_argument("--batch_size", type=int, default=None)
+    parser.add_argument(
+        "--skip_artifact_validation",
+        action="store_true",
+        help="Skip tokenizer/config/data hash validation against artifacts manifest (not recommended).",
+    )
     args = parser.parse_args()
 
     model_cfg = load_yaml(args.model_config)["model"]
@@ -127,6 +241,19 @@ def main():
     args.repetition_penalty = args.repetition_penalty if args.repetition_penalty is not None else eval_cfg.get("repetition_penalty", 1.1)
     data_cfg = train_cfg["data"]
     optim_cfg = train_cfg["training"]
+    checkpoint_upload_cfg = train_cfg.get("checkpoint_upload", {})
+
+    if not args.skip_artifact_validation:
+        repo_id = checkpoint_upload_cfg.get("repo_id")
+        artifact_manifest, manifest_source = _load_artifact_manifest(args.checkpoint, repo_id)
+        if artifact_manifest is None:
+            raise SystemExit(
+                "Missing artifacts manifest for checkpoint validation. "
+                "Expected local artifacts_manifest.json or remote "
+                "'artifacts/artifacts_manifest.json' in checkpoint_upload.repo_id."
+            )
+        _validate_artifacts_or_die(artifact_manifest, args.tokenizer_model, args.model_config, data_cfg)
+        print(f"[artifact] validated with {manifest_source}")
 
     config = LlamaConfig(
         vocab_size=model_cfg["vocab_size"],
@@ -170,16 +297,17 @@ def main():
     special_ids = {token_id for token_id in special_ids if token_id is not None}
 
     val_data = load_memmap(data_cfg["val_bin"], np.dtype(data_cfg["dtype"]))
+    batch_size = args.batch_size if args.batch_size is not None else optim_cfg["micro_batch_size"]
     loss = eval_loss(
         model,
         val_data,
-        optim_cfg["micro_batch_size"],
+        batch_size,
         data_cfg["block_size"],
         device,
         args.batches,
         optim_cfg["seed"],
     )
-    ppl = math.exp(min(20, loss))
+    ppl = float("nan") if math.isnan(loss) else math.exp(min(20, loss))
 
     print(f"val_loss={loss:.4f} ppl={ppl:.2f}")
     print(

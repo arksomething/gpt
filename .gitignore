@@ -12,12 +12,21 @@ __pycache__/
 # Training outputs
 /runs/
 *.log
+**/.hf_resume/
+**/.tmp_checkpoints/
+**/artifacts_manifest.json
+**/checkpoint_manifest.json
+**/fixed_prompt_samples.txt
 
 # Large binary datasets/checkpoints
 /data/
 *.pt
 *.ckpt
 *.safetensors
+*.bin
+*.npy
+*.npz
 
 # Tokenizer artifacts that are derived
 /tokenizer/corpus.txt
+/tokenizer/archive/

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Prepare memmapped token data from C4, Wikipedia, and Project Gutenberg.
+Prepare memmapped token data from C4, Wikipedia, and FineWeb.
 
 Features:
 - Streams data from HuggingFace datasets
@@ -49,11 +49,9 @@ from scripts.filters import (
     MinHashDeduplicator,
     apply_c4_filters,
     apply_global_filters,
-    apply_gutenberg_filters,
     apply_wiki_filters,
     chunk_text,
 )
-from scripts.gutenberg import stream_gutenberg as _stream_gutenberg_impl
 
 
 # =============================================================================
@@ -144,7 +142,7 @@ class Checkpoint:
     docs_processed: int
     c4_docs: int
     wiki_docs: int
-    gutenberg_docs: int
+    fineweb_docs: int
     dedup_rejects: int
     elapsed_seconds: float
     timestamp: str
@@ -156,7 +154,9 @@ class Checkpoint:
             "docs_processed": self.docs_processed,
             "c4_docs": self.c4_docs,
             "wiki_docs": self.wiki_docs,
-            "gutenberg_docs": self.gutenberg_docs,
+            "fineweb_docs": self.fineweb_docs,
+            # Backward-compatible alias for older checkpoints/metadata readers.
+            "gutenberg_docs": self.fineweb_docs,
             "dedup_rejects": self.dedup_rejects,
             "elapsed_seconds": self.elapsed_seconds,
             "timestamp": self.timestamp,
@@ -170,7 +170,7 @@ class Checkpoint:
             docs_processed=d["docs_processed"],
             c4_docs=d["c4_docs"],
             wiki_docs=d["wiki_docs"],
-            gutenberg_docs=d["gutenberg_docs"],
+            fineweb_docs=d.get("fineweb_docs", d.get("gutenberg_docs", 0)),
             dedup_rejects=d["dedup_rejects"],
             elapsed_seconds=d["elapsed_seconds"],
             timestamp=d["timestamp"],
@@ -200,17 +200,44 @@ def save_checkpoint(checkpoint: Checkpoint, checkpoint_path: str):
 # =============================================================================
 
 
-def stream_gutenberg(seed: int = 42) -> Iterator[str]:
-    """Stream text from Project Gutenberg (PG-19)."""
-    print("[gutenberg] Loading dataset...", flush=True)
+def stream_fineweb(seed: int = 42) -> Iterator[str]:
+    """Stream text from FineWeb-Edu."""
+    repo = os.environ.get("FINEWEB_REPO", "HuggingFaceFW/fineweb-edu")
+    config = os.environ.get("FINEWEB_CONFIG", "sample-10BT")
+    split = os.environ.get("FINEWEB_SPLIT", "train")
+    text_field = os.environ.get("FINEWEB_TEXT_FIELD", "text")
+    shuffle_buffer = int(os.environ.get("FINEWEB_SHUFFLE_BUFFER", "0") or 0)
+
+    print(
+        f"[fineweb] Loading dataset repo={repo} config={config} split={split}...",
+        flush=True,
+    )
+    if config:
+        ds = load_dataset(repo, config, split=split, streaming=True)
+    else:
+        ds = load_dataset(repo, split=split, streaming=True)
+    if shuffle_buffer > 1:
+        ds = ds.shuffle(seed=seed, buffer_size=shuffle_buffer)
+        print(f"[fineweb] Starting iteration (shuffle buffer={shuffle_buffer})...", flush=True)
+    else:
+        print("[fineweb] Starting iteration (no shuffle)...", flush=True)
+
     count = 0
-    for text in _stream_gutenberg_impl(seed=seed, split="train"):
-        yield text
-        count += 1
-        if count == 1:
-            print(f"[gutenberg] First document yielded", flush=True)
-        elif count % 500 == 0:
-            print(f"[gutenberg] {count:,} docs", flush=True)
+    for example in ds:
+        text = example.get(text_field) if isinstance(example, dict) else None
+        if isinstance(text, str) and text.strip():
+            yield text
+            count += 1
+            if count == 1:
+                print("[fineweb] First document yielded", flush=True)
+            elif count % 5000 == 0:
+                print(f"[fineweb] {count:,} docs", flush=True)
+
+
+def stream_gutenberg(seed: int = 42) -> Iterator[str]:
+    """Deprecated alias retained for backward compatibility."""
+    print("[data] stream_gutenberg() is deprecated; using FineWeb stream instead.")
+    yield from stream_fineweb(seed=seed)
 
 
 def load_yaml(path: str) -> dict:
@@ -252,8 +279,8 @@ class FilterConfig:
     # Wikipedia-specific
     wiki_max_list_ratio: float = 0.30
 
-    # Gutenberg-specific
-    gutenberg_filter_poetry: bool = False
+    # FineWeb-specific (reserved for future source-specific filters)
+    fineweb_filter_poetry: bool = False
 
     # Deduplication
     dedup_enabled: bool = True
@@ -280,7 +307,10 @@ class FilterConfig:
             c4_min_entropy=d.get("c4_min_entropy", 3.5),
             c4_max_entropy=d.get("c4_max_entropy", 5.6),
             wiki_max_list_ratio=d.get("wiki_max_list_ratio", 0.30),
-            gutenberg_filter_poetry=d.get("gutenberg_filter_poetry", False),
+            fineweb_filter_poetry=d.get(
+                "fineweb_filter_poetry",
+                d.get("gutenberg_filter_poetry", False),
+            ),
             dedup_enabled=d.get("dedup_enabled", True),
             dedup_threshold=d.get("dedup_similarity_threshold", 0.85),
             dedup_num_perm=d.get("dedup_num_perm", 128),
@@ -433,20 +463,12 @@ def filter_and_transform_wiki(
     return chunks
 
 
-def filter_and_transform_gutenberg(
+def filter_and_transform_fineweb(
     text: str,
     filter_cfg: FilterConfig,
     stats: FilterStats,
 ) -> List[str]:
-    """Apply Gutenberg-specific and global filters, return chunks that pass."""
-    text, passed, reason = apply_gutenberg_filters(
-        text,
-        filter_poetry=filter_cfg.gutenberg_filter_poetry,
-    )
-    if not passed:
-        stats.record_reject(f"gutenberg_{reason}")
-        return []
-
+    """Apply global filters to FineWeb and return chunks that pass."""
     passed, reason = apply_global_filters(
         text,
         min_chars=filter_cfg.min_chars,
@@ -458,7 +480,7 @@ def filter_and_transform_gutenberg(
         max_caps_ratio=filter_cfg.max_caps_ratio,
     )
     if not passed:
-        stats.record_reject(f"gutenberg_{reason}")
+        stats.record_reject(f"fineweb_{reason}")
         return []
 
     chunks = chunk_text(text, filter_cfg.max_chunk_chars, filter_cfg.min_chunk_chars)
@@ -477,22 +499,21 @@ def filter_and_transform_gutenberg(
 def interleave_sources(
     c4_iter: Iterator[str],
     wiki_iter: Iterator[str],
-    gutenberg_iter: Iterator[str],
+    fineweb_iter: Iterator[str],
     c4_weight: float,
     wiki_weight: float,
-    gutenberg_weight: float,
+    fineweb_weight: float,
     seed: int = 42,
 ) -> Iterator[tuple]:
     """Interleave sources according to weights. Yields (source_name, text) tuples."""
     rng = random.Random(seed)
 
-    total = c4_weight + wiki_weight + gutenberg_weight
-    c4_exhausted = False
-    wiki_exhausted = False
-    gutenberg_exhausted = False
+    c4_exhausted = c4_weight <= 0
+    wiki_exhausted = wiki_weight <= 0
+    fineweb_exhausted = fineweb_weight <= 0
 
     while True:
-        if c4_exhausted and wiki_exhausted and gutenberg_exhausted:
+        if c4_exhausted and wiki_exhausted and fineweb_exhausted:
             break
 
         available_weight = 0.0
@@ -500,8 +521,8 @@ def interleave_sources(
             available_weight += c4_weight
         if not wiki_exhausted:
             available_weight += wiki_weight
-        if not gutenberg_exhausted:
-            available_weight += gutenberg_weight
+        if not fineweb_exhausted:
+            available_weight += fineweb_weight
 
         if available_weight == 0:
             break
@@ -518,8 +539,8 @@ def interleave_sources(
             cumulative += wiki_weight
             if roll < cumulative:
                 selected = "wiki"
-        if selected is None and not gutenberg_exhausted:
-            selected = "gutenberg"
+        if selected is None and not fineweb_exhausted:
+            selected = "fineweb"
 
         try:
             if selected == "c4":
@@ -528,16 +549,16 @@ def interleave_sources(
             elif selected == "wiki":
                 text = next(wiki_iter)
                 yield ("wiki", text)
-            elif selected == "gutenberg":
-                text = next(gutenberg_iter)
-                yield ("gutenberg", text)
+            elif selected == "fineweb":
+                text = next(fineweb_iter)
+                yield ("fineweb", text)
         except StopIteration:
             if selected == "c4":
                 c4_exhausted = True
             elif selected == "wiki":
                 wiki_exhausted = True
-            elif selected == "gutenberg":
-                gutenberg_exhausted = True
+            elif selected == "fineweb":
+                fineweb_exhausted = True
 
 
 # =============================================================================
@@ -645,7 +666,7 @@ def write_tokens_to_memmap(
                     docs_processed=doc_count,
                     c4_docs=stats["c4"].total_docs if stats else 0,
                     wiki_docs=stats["wiki"].total_docs if stats else 0,
-                    gutenberg_docs=stats["gutenberg"].total_docs if stats else 0,
+                    fineweb_docs=stats["fineweb"].total_docs if stats else 0,
                     dedup_rejects=stats.get("dedup_rejects", 0) if stats else 0,
                     elapsed_seconds=elapsed,
                     timestamp=datetime.utcnow().isoformat() + "Z",
@@ -714,21 +735,25 @@ def process_and_tokenize(
             return
         last_log_time = now
         
-        total_seen = stats["c4"].total_docs + stats["wiki"].total_docs + stats["gutenberg"].total_docs
+        total_seen = stats["c4"].total_docs + stats["wiki"].total_docs + stats["fineweb"].total_docs
         c4_pass = stats["c4"].passed_docs
         wiki_pass = stats["wiki"].passed_docs
-        gut_pass = stats["gutenberg"].passed_docs
-        total_pass = c4_pass + wiki_pass + gut_pass
+        fineweb_pass = stats["fineweb"].passed_docs
+        total_pass = c4_pass + wiki_pass + fineweb_pass
         
         c4_rate = (c4_pass / stats["c4"].total_docs * 100) if stats["c4"].total_docs > 0 else 0
         wiki_rate = (wiki_pass / stats["wiki"].total_docs * 100) if stats["wiki"].total_docs > 0 else 0
-        gut_rate = (gut_pass / stats["gutenberg"].total_docs * 100) if stats["gutenberg"].total_docs > 0 else 0
+        fineweb_rate = (
+            fineweb_pass / stats["fineweb"].total_docs * 100
+            if stats["fineweb"].total_docs > 0
+            else 0
+        )
         
         print(
             f"[filter] Seen {total_seen:,} docs | "
             f"Passed: C4 {c4_pass:,} ({c4_rate:.1f}%), "
             f"Wiki {wiki_pass:,} ({wiki_rate:.1f}%), "
-            f"Gut {gut_pass:,} ({gut_rate:.1f}%) | "
+            f"FineWeb {fineweb_pass:,} ({fineweb_rate:.1f}%) | "
             f"Yielded: {docs_yielded:,} | "
             f"Dedup: {dedup_rejects:,} | UNK: {unk_rejects:,}",
             flush=True
@@ -739,8 +764,8 @@ def process_and_tokenize(
             chunks = filter_and_transform_c4(text, filter_cfg, stats["c4"])
         elif source_name == "wiki":
             chunks = filter_and_transform_wiki(text, filter_cfg, stats["wiki"])
-        elif source_name == "gutenberg":
-            chunks = filter_and_transform_gutenberg(text, filter_cfg, stats["gutenberg"])
+        elif source_name == "fineweb":
+            chunks = filter_and_transform_fineweb(text, filter_cfg, stats["fineweb"])
         else:
             continue
         
@@ -799,7 +824,13 @@ Examples:
     parser.add_argument("--val_tokens", type=int, default=None, help="Target val tokens")
     parser.add_argument("--c4_weight", type=float, default=None, help="C4 sampling weight")
     parser.add_argument("--wiki_weight", type=float, default=None, help="Wikipedia sampling weight")
-    parser.add_argument("--gutenberg_weight", type=float, default=None, help="Gutenberg sampling weight")
+    parser.add_argument("--fineweb_weight", type=float, default=None, help="FineWeb sampling weight")
+    parser.add_argument(
+        "--gutenberg_weight",
+        type=float,
+        default=None,
+        help="Deprecated alias for --fineweb_weight.",
+    )
     parser.add_argument("--shuffle_buffer", type=int, default=None, help="Shuffle buffer size")
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
     parser.add_argument("--log_interval", type=int, default=None, help="Seconds between logs")
@@ -831,9 +862,22 @@ Examples:
     val_tokens = args.val_tokens or data_prep_cfg.get("val_tokens", 20_000_000)
     c4_weight = args.c4_weight if args.c4_weight is not None else data_prep_cfg.get("c4_weight", 0.30)
     wiki_weight = args.wiki_weight if args.wiki_weight is not None else data_prep_cfg.get("wiki_weight", 0.45)
-    gutenberg_weight = (
-        args.gutenberg_weight if args.gutenberg_weight is not None else data_prep_cfg.get("gutenberg_weight", 0.25)
+    fineweb_weight = (
+        args.fineweb_weight if args.fineweb_weight is not None else data_prep_cfg.get("fineweb_weight")
     )
+    if fineweb_weight is None:
+        fineweb_weight = (
+            args.gutenberg_weight
+            if args.gutenberg_weight is not None
+            else data_prep_cfg.get("gutenberg_weight", 0.0)
+        )
+        if args.gutenberg_weight is not None:
+            print("[data] --gutenberg_weight is deprecated; treating it as --fineweb_weight.")
+    elif args.gutenberg_weight is not None:
+        print("[data] --gutenberg_weight ignored because --fineweb_weight is set.")
+
+    if c4_weight <= 0 and wiki_weight <= 0 and fineweb_weight <= 0:
+        raise SystemExit("At least one of c4_weight, wiki_weight, or fineweb_weight must be > 0.")
     shuffle_buffer = args.shuffle_buffer or data_prep_cfg.get("shuffle_buffer", 50000)
     seed = args.seed if args.seed is not None else data_prep_cfg.get("seed", 1337)
     log_interval = args.log_interval or data_prep_cfg.get("log_interval", 30)
@@ -894,7 +938,7 @@ Examples:
         print(f"\nData preparation configuration:")
         print(f"  C4 weight: {c4_weight}")
         print(f"  Wikipedia weight: {wiki_weight}")
-        print(f"  Gutenberg weight: {gutenberg_weight}")
+        print(f"  FineWeb weight: {fineweb_weight}")
         print(f"  Train tokens: {train_tokens:,}")
         print(f"  Val tokens: {val_tokens:,}")
         print(f"  Shuffle buffer: {shuffle_buffer:,}")
@@ -914,7 +958,7 @@ Examples:
         stats = {
             "c4": FilterStats(),
             "wiki": FilterStats(),
-            "gutenberg": FilterStats(),
+            "fineweb": FilterStats(),
             "dedup_rejects": 0,
         }
 
@@ -932,15 +976,15 @@ Examples:
 
             c4_iter = stream_c4(seed)
             wiki_iter = stream_wikipedia(seed)
-            gutenberg_iter = stream_gutenberg(seed)
+            fineweb_iter = stream_fineweb(seed) if fineweb_weight > 0 else iter(())
 
             source_iter = interleave_sources(
                 c4_iter,
                 wiki_iter,
-                gutenberg_iter,
+                fineweb_iter,
                 c4_weight,
                 wiki_weight,
-                gutenberg_weight,
+                fineweb_weight,
                 seed,
             )
 
@@ -977,8 +1021,8 @@ Examples:
             print(stats["c4"].report())
             print("\nWikipedia:")
             print(stats["wiki"].report())
-            print("\nGutenberg:")
-            print(stats["gutenberg"].report())
+            print("\nFineWeb:")
+            print(stats["fineweb"].report())
             print(f"\nDeduplication rejects: {stats['dedup_rejects']:,}")
 
             if was_interrupted:
@@ -997,22 +1041,22 @@ Examples:
             val_stats = {
                 "c4": FilterStats(),
                 "wiki": FilterStats(),
-                "gutenberg": FilterStats(),
+                "fineweb": FilterStats(),
                 "dedup_rejects": 0,
             }
 
             val_seed = seed + 999
             c4_iter = stream_c4(val_seed)
             wiki_iter = stream_wikipedia(val_seed)
-            gutenberg_iter = stream_gutenberg(val_seed)
+            fineweb_iter = stream_fineweb(val_seed) if fineweb_weight > 0 else iter(())
 
             source_iter = interleave_sources(
                 c4_iter,
                 wiki_iter,
-                gutenberg_iter,
+                fineweb_iter,
                 c4_weight,
                 wiki_weight,
-                gutenberg_weight,
+                fineweb_weight,
                 val_seed,
             )
 
@@ -1060,7 +1104,9 @@ Examples:
             "eos_token_id": eos_token_id,
             "c4_weight": c4_weight,
             "wiki_weight": wiki_weight,
-            "gutenberg_weight": gutenberg_weight,
+            "fineweb_weight": fineweb_weight,
+            # Backward-compatible alias.
+            "gutenberg_weight": fineweb_weight,
             "seed": seed,
             "tokenizer_model": os.path.abspath(tokenizer_model),
             "tokenizer_sha256": tokenizer_sha256,
@@ -1082,8 +1128,11 @@ Examples:
                 "c4_passed": stats["c4"].passed_docs,
                 "wiki_total": stats["wiki"].total_docs,
                 "wiki_passed": stats["wiki"].passed_docs,
-                "gutenberg_total": stats["gutenberg"].total_docs,
-                "gutenberg_passed": stats["gutenberg"].passed_docs,
+                "fineweb_total": stats["fineweb"].total_docs,
+                "fineweb_passed": stats["fineweb"].passed_docs,
+                # Backward-compatible aliases.
+                "gutenberg_total": stats["fineweb"].total_docs,
+                "gutenberg_passed": stats["fineweb"].passed_docs,
                 "dedup_rejects": stats["dedup_rejects"],
             },
             "created_at": datetime.utcnow().isoformat() + "Z",

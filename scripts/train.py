@@ -8,6 +8,7 @@ import random
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -17,7 +18,7 @@ import yaml
 import sentencepiece as spm
 from accelerate import Accelerator
 from transformers import LlamaConfig, LlamaForCausalLM, get_cosine_schedule_with_warmup
-from huggingface_hub import HfApi, login as hf_login
+from huggingface_hub import HfApi, hf_hub_download, login as hf_login
 
 
 def load_yaml(path):
@@ -44,6 +45,139 @@ def _load_json_if_exists(path):
             return json.load(f)
     except (OSError, json.JSONDecodeError):
         return None
+
+
+def _utc_now_iso():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _git_head_commit():
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+    except Exception:
+        return None
+
+
+def _git_is_dirty():
+    try:
+        output = subprocess.check_output(
+            ["git", "status", "--porcelain"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        return bool(output.strip())
+    except Exception:
+        return None
+
+
+def _parse_step_name(step_dir):
+    if not step_dir or not step_dir.startswith("step_"):
+        return None
+    suffix = step_dir[len("step_") :]
+    if not suffix.isdigit():
+        return None
+    return int(suffix)
+
+
+def _find_data_meta_path(data_cfg):
+    train_bin = data_cfg.get("train_bin")
+    if not train_bin:
+        return None
+    return os.path.join(os.path.dirname(train_bin) or ".", "data_meta.json")
+
+
+def _build_artifact_manifest(model_config_path, train_config_path, model_cfg, train_cfg, data_cfg):
+    tokenizer_path = _resolve_tokenizer_path(train_cfg)
+    tokenizer_info = {
+        "path": os.path.abspath(tokenizer_path) if tokenizer_path else None,
+        "sha256": None,
+        "vocab_size": None,
+    }
+    if tokenizer_path and os.path.exists(tokenizer_path):
+        tokenizer_info["sha256"] = _file_sha256(tokenizer_path)
+        sp = spm.SentencePieceProcessor()
+        sp.load(tokenizer_path)
+        tokenizer_info["vocab_size"] = int(sp.vocab_size())
+
+    data_meta_path = _find_data_meta_path(data_cfg)
+    data_meta = _load_json_if_exists(data_meta_path) if data_meta_path else None
+    data_meta_info = {
+        "path": os.path.abspath(data_meta_path) if data_meta_path and os.path.exists(data_meta_path) else None,
+        "sha256": _file_sha256(data_meta_path) if data_meta_path and os.path.exists(data_meta_path) else None,
+        "tokenizer_sha256": (data_meta or {}).get("tokenizer_sha256"),
+        "tokenizer_vocab_size": (data_meta or {}).get("tokenizer_vocab_size"),
+    }
+
+    model_cfg_sha = _file_sha256(model_config_path) if os.path.exists(model_config_path) else None
+    train_cfg_sha = _file_sha256(train_config_path) if os.path.exists(train_config_path) else None
+
+    return {
+        "schema_version": 1,
+        "created_at": _utc_now_iso(),
+        "git": {
+            "commit": _git_head_commit(),
+            "dirty": _git_is_dirty(),
+        },
+        "model_config": {
+            "path": os.path.abspath(model_config_path),
+            "sha256": model_cfg_sha,
+            "vocab_size": model_cfg.get("vocab_size"),
+        },
+        "train_config": {
+            "path": os.path.abspath(train_config_path),
+            "sha256": train_cfg_sha,
+        },
+        "tokenizer": tokenizer_info,
+        "data": {
+            "train_bin": data_cfg.get("train_bin"),
+            "val_bin": data_cfg.get("val_bin"),
+            "hf_repo": data_cfg.get("hf_repo"),
+            "data_meta": data_meta_info,
+        },
+    }
+
+
+def _save_artifact_manifest(output_dir, artifact_manifest):
+    path = os.path.join(output_dir, "artifacts_manifest.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(artifact_manifest, f, indent=2, sort_keys=True)
+    return path
+
+
+def _collect_artifact_upload_files(artifact_manifest, artifact_manifest_path, model_config_path, train_config_path):
+    uploads = []
+    seen = set()
+
+    def _add(local_path, remote_path):
+        if not local_path or not os.path.exists(local_path):
+            return
+        key = (os.path.abspath(local_path), remote_path)
+        if key in seen:
+            return
+        seen.add(key)
+        uploads.append((local_path, remote_path))
+
+    _add(artifact_manifest_path, "artifacts/artifacts_manifest.json")
+    _add(model_config_path, f"artifacts/configs/{os.path.basename(model_config_path)}")
+    _add(train_config_path, f"artifacts/configs/{os.path.basename(train_config_path)}")
+
+    tokenizer_path = (artifact_manifest.get("tokenizer") or {}).get("path")
+    if tokenizer_path:
+        tokenizer_name = os.path.basename(tokenizer_path)
+        _add(tokenizer_path, f"artifacts/tokenizer/{tokenizer_name}")
+        tokenizer_dir = os.path.dirname(tokenizer_path)
+        _add(os.path.join(tokenizer_dir, "spm.vocab"), "artifacts/tokenizer/spm.vocab")
+        _add(os.path.join(tokenizer_dir, "tokenizer_meta.json"), "artifacts/tokenizer/tokenizer_meta.json")
+
+    data_meta_path = (((artifact_manifest.get("data") or {}).get("data_meta") or {}).get("path"))
+    if data_meta_path:
+        _add(data_meta_path, "artifacts/data/data_meta.json")
+
+    return uploads
 
 
 def _resolve_tokenizer_path(train_cfg):
@@ -158,103 +292,305 @@ def _verify_tokenizer_compat(model_cfg, train_cfg, data_cfg):
 
 
 class CheckpointUploader:
-    """Uploads checkpoints to HuggingFace Hub."""
-    
+    """Uploads/checks/resumes checkpoints from HuggingFace Hub."""
+
     def __init__(self, config: dict):
         self.enabled = config.get("enabled", False)
         self.repo_id = config.get("repo_id")
         self.upload_interval = config.get("upload_interval", 1000)
-        self.delete_after_upload = config.get("delete_local_after_upload", False)
         self.upload_optimizer = config.get("upload_optimizer", False)
         self.token = config.get("token") or os.environ.get("HF_TOKEN")
+        self.retry_max_attempts = max(1, int(config.get("retry_max_attempts", 3)))
+        self.retry_backoff_seconds = max(1, int(config.get("retry_backoff_seconds", 5)))
+        self.verify_upload = bool(config.get("verify_upload", True))
+        retention_cfg = config.get("retention", {}) or {}
+        self.prune_remote_enabled = bool(retention_cfg.get("enabled", True))
+        self.keep_latest = max(0, int(retention_cfg.get("keep_latest", 1)))
+        self.keep_best = max(0, int(retention_cfg.get("keep_best", 2)))
         self._api = None
         self._last_upload_step = 0
-        
+
         if self.enabled and not self.repo_id:
             print("[checkpoint_upload] Warning: enabled but no repo_id set, disabling")
             self.enabled = False
-        
+
+        if self.enabled and not self.upload_optimizer:
+            print(
+                "[checkpoint_upload] Note: upload_optimizer=false is ignored in exact-resume mode; "
+                "full Accelerate checkpoint folders are uploaded."
+            )
+
         if self.enabled and self.token:
             try:
                 hf_login(token=self.token, add_to_git_credential=False)
             except Exception as e:
                 print(f"[checkpoint_upload] Warning: HF login failed: {e}")
-    
+
     @property
     def api(self):
         if self._api is None:
             self._api = HfApi()
-            # Create repo if it doesn't exist
             if self.enabled:
                 try:
                     self._api.create_repo(self.repo_id, repo_type="model", exist_ok=True)
                 except Exception as e:
                     print(f"[checkpoint_upload] Warning: Could not create repo: {e}")
         return self._api
-    
+
+    def _with_retries(self, op_name, fn):
+        last_error = None
+        for attempt in range(1, self.retry_max_attempts + 1):
+            try:
+                return fn()
+            except Exception as e:
+                last_error = e
+                print(
+                    f"[checkpoint_upload] {op_name} failed on attempt "
+                    f"{attempt}/{self.retry_max_attempts}: {e}"
+                )
+                if attempt < self.retry_max_attempts:
+                    delay = self.retry_backoff_seconds * (2 ** (attempt - 1))
+                    time.sleep(delay)
+        raise RuntimeError(f"{op_name} failed after retries: {last_error}") from last_error
+
     def should_upload(self, step: int) -> bool:
-        """Check if we should upload at this step."""
         if not self.enabled:
             return False
-        if step - self._last_upload_step >= self.upload_interval:
-            return True
-        return False
-    
+        return step - self._last_upload_step >= self.upload_interval
+
+    def _collect_relative_files(self, folder_path):
+        rel_paths = []
+        for root, _, files in os.walk(folder_path):
+            for filename in files:
+                full_path = os.path.join(root, filename)
+                rel_paths.append(os.path.relpath(full_path, folder_path))
+        return sorted(rel_paths)
+
+    def _verify_remote_files(self, folder_name, relative_files):
+        remote_files = set(self.api.list_repo_files(self.repo_id, repo_type="model"))
+        expected = {f"{folder_name}/{rel}" for rel in relative_files}
+        missing = sorted(expected - remote_files)
+        return missing
+
     def upload(self, checkpoint_dir: str, step: int, is_final: bool = False):
-        """Upload checkpoint to HuggingFace Hub."""
         if not self.enabled:
-            return
-        
+            return False
+
+        if not os.path.isdir(checkpoint_dir):
+            print(f"[checkpoint_upload] Checkpoint directory does not exist: {checkpoint_dir}")
+            return False
+
+        folder_name = "final" if is_final else f"step_{step:07d}"
+        expected_files = self._collect_relative_files(checkpoint_dir)
+        if not expected_files:
+            print(f"[checkpoint_upload] Nothing to upload in {checkpoint_dir}")
+            return False
+
         try:
-            folder_name = "final" if is_final else f"step_{step:07d}"
-            
-            # Determine which files to upload
-            files_to_upload = ["model.pt", "model.safetensors"]
-            if self.upload_optimizer:
-                files_to_upload.extend(["optimizer.bin", "scheduler.bin", "random_states_0.pkl"])
-            
-            uploaded_files = []
-            for filename in files_to_upload:
-                filepath = os.path.join(checkpoint_dir, filename)
-                if os.path.exists(filepath):
-                    self.api.upload_file(
-                        path_or_fileobj=filepath,
-                        path_in_repo=f"{folder_name}/{filename}",
-                        repo_id=self.repo_id,
-                        repo_type="model",
+            self._with_retries(
+                f"upload checkpoint {folder_name}",
+                lambda: self.api.upload_folder(
+                    folder_path=checkpoint_dir,
+                    path_in_repo=folder_name,
+                    repo_id=self.repo_id,
+                    repo_type="model",
+                    commit_message=f"Upload {folder_name}",
+                ),
+            )
+
+            if self.verify_upload:
+                missing = self._with_retries(
+                    f"verify checkpoint {folder_name}",
+                    lambda: self._verify_remote_files(folder_name, expected_files),
+                )
+                if missing:
+                    raise RuntimeError(
+                        f"Remote checkpoint verification failed for {folder_name}. "
+                        f"Missing files: {missing[:8]}"
                     )
-                    uploaded_files.append(filename)
-            
-            print(f"[checkpoint_upload] Uploaded {folder_name} to {self.repo_id} ({', '.join(uploaded_files)})")
+
+            print(
+                f"[checkpoint_upload] Uploaded {folder_name} to {self.repo_id} "
+                f"({len(expected_files)} files)"
+            )
             self._last_upload_step = step
-            
-            # Delete local checkpoint if configured
-            if self.delete_after_upload and not is_final:
-                shutil.rmtree(checkpoint_dir)
-                print(f"[checkpoint_upload] Deleted local checkpoint {checkpoint_dir}")
-                
+            return True
         except Exception as e:
             print(f"[checkpoint_upload] Error uploading checkpoint: {e}")
-    
+            return False
+
     def upload_logs(self, output_dir: str):
-        """Upload training logs to HuggingFace Hub."""
         if not self.enabled:
-            return
-        
+            return False
+
         try:
-            log_files = ["train.log", "fixed_prompt_samples.txt"]
+            log_files = [
+                "train.log",
+                "fixed_prompt_samples.txt",
+                "checkpoint_manifest.json",
+                "artifacts_manifest.json",
+            ]
             for filename in log_files:
                 filepath = os.path.join(output_dir, filename)
                 if os.path.exists(filepath):
-                    self.api.upload_file(
-                        path_or_fileobj=filepath,
-                        path_in_repo=filename,
-                        repo_id=self.repo_id,
-                        repo_type="model",
+                    self._with_retries(
+                        f"upload log {filename}",
+                        lambda filepath=filepath, filename=filename: self.api.upload_file(
+                            path_or_fileobj=filepath,
+                            path_in_repo=filename,
+                            repo_id=self.repo_id,
+                            repo_type="model",
+                        ),
                     )
             print(f"[checkpoint_upload] Uploaded logs to {self.repo_id}")
+            return True
         except Exception as e:
             print(f"[checkpoint_upload] Error uploading logs: {e}")
+            return False
+
+    def upload_artifacts(self, local_to_remote_files):
+        if not self.enabled:
+            return False
+        uploaded_any = False
+        try:
+            for local_path, remote_path in local_to_remote_files:
+                if not os.path.exists(local_path):
+                    continue
+                self._with_retries(
+                    f"upload artifact {remote_path}",
+                    lambda local_path=local_path, remote_path=remote_path: self.api.upload_file(
+                        path_or_fileobj=local_path,
+                        path_in_repo=remote_path,
+                        repo_id=self.repo_id,
+                        repo_type="model",
+                    ),
+                )
+                uploaded_any = True
+            if uploaded_any:
+                print(f"[checkpoint_upload] Uploaded artifacts to {self.repo_id}")
+            return uploaded_any
+        except Exception as e:
+            print(f"[checkpoint_upload] Error uploading artifacts: {e}")
+            return False
+
+    def _list_remote_step_dirs(self):
+        files = self.api.list_repo_files(self.repo_id, repo_type="model")
+        step_dirs = set()
+        for path in files:
+            top_level = path.split("/", 1)[0]
+            if _parse_step_name(top_level) is not None:
+                step_dirs.add(top_level)
+        return sorted(step_dirs, key=lambda name: _parse_step_name(name) or -1)
+
+    def resolve_remote_step(self, selector, manifest):
+        if not self.enabled:
+            return None
+
+        selector = (selector or "").strip()
+        if selector == "final":
+            files = self.api.list_repo_files(self.repo_id, repo_type="model")
+            if any(path.startswith("final/") for path in files):
+                return "final"
+            return None
+        remote_steps = self._list_remote_step_dirs()
+        if not remote_steps:
+            return None
+
+        if selector == "latest":
+            manifest_last = manifest.get("last")
+            if manifest_last in remote_steps:
+                return manifest_last
+            return remote_steps[-1]
+
+        if selector == "best":
+            for entry in manifest.get("best", []):
+                step_dir = entry.get("step")
+                if step_dir in remote_steps:
+                    return step_dir
+            return remote_steps[-1]
+
+        if selector.isdigit():
+            selector = f"step_{int(selector):07d}"
+        if selector.startswith("step_") and selector in remote_steps:
+            return selector
+        return None
+
+    def download_checkpoint(self, step_dir, output_dir):
+        if not self.enabled:
+            raise RuntimeError("Checkpoint uploader is disabled.")
+        if step_dir == "final":
+            prefix = "final/"
+        else:
+            prefix = f"{step_dir}/"
+        files = self.api.list_repo_files(self.repo_id, repo_type="model")
+        target_files = [path for path in files if path.startswith(prefix)]
+        if not target_files:
+            raise RuntimeError(
+                f"Remote checkpoint '{step_dir}' not found in {self.repo_id}."
+            )
+
+        restore_root = os.path.join(output_dir, ".hf_resume")
+        os.makedirs(restore_root, exist_ok=True)
+        for remote_file in target_files:
+            self._with_retries(
+                f"download {remote_file}",
+                lambda remote_file=remote_file: hf_hub_download(
+                    repo_id=self.repo_id,
+                    filename=remote_file,
+                    repo_type="model",
+                    local_dir=restore_root,
+                ),
+            )
+
+        local_path = os.path.join(restore_root, step_dir)
+        if not os.path.isdir(local_path):
+            raise RuntimeError(
+                f"Checkpoint download completed but folder missing locally: {local_path}"
+            )
+        return local_path
+
+    def prune_remote(self, manifest):
+        if not self.enabled or not self.prune_remote_enabled:
+            return
+        if self.keep_latest <= 0 and self.keep_best <= 0:
+            return
+
+        remote_steps = self._list_remote_step_dirs()
+        if not remote_steps:
+            return
+
+        keep = set()
+        if self.keep_latest > 0:
+            keep.update(remote_steps[-self.keep_latest :])
+        if manifest.get("last"):
+            keep.add(manifest["last"])
+        if self.keep_best > 0:
+            for entry in manifest.get("best", [])[: self.keep_best]:
+                step_dir = entry.get("step")
+                if step_dir in remote_steps:
+                    keep.add(step_dir)
+        for step_dir in (manifest.get("good_slots") or {}).values():
+            if step_dir in remote_steps:
+                keep.add(step_dir)
+
+        to_delete = [step_dir for step_dir in remote_steps if step_dir not in keep]
+        if not to_delete:
+            return
+
+        for step_dir in to_delete:
+            try:
+                self._with_retries(
+                    f"delete remote {step_dir}",
+                    lambda step_dir=step_dir: self.api.delete_folder(
+                        path_in_repo=step_dir,
+                        repo_id=self.repo_id,
+                        repo_type="model",
+                        commit_message=f"Prune {step_dir}",
+                    ),
+                )
+                print(f"[checkpoint_upload] Pruned remote checkpoint {step_dir}")
+            except Exception as e:
+                print(f"[checkpoint_upload] Warning: failed to prune {step_dir}: {e}")
 
 
 class Tee:
@@ -314,6 +650,53 @@ def set_seed(seed):
 
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters())
+
+
+def build_adamw_param_groups(model, weight_decay):
+    """Build AdamW groups with selective weight decay for LLMs."""
+    decay_params = []
+    no_decay_params = []
+    seen = set()
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+
+        # Skip duplicate references (e.g., tied embeddings/lm_head).
+        param_id = id(param)
+        if param_id in seen:
+            continue
+        seen.add(param_id)
+
+        lname = name.lower()
+        is_no_decay = (
+            param.ndim < 2
+            or lname.endswith(".bias")
+            or "norm" in lname
+            or "embed_tokens" in lname
+            or "lm_head" in lname
+        )
+        if is_no_decay:
+            no_decay_params.append(param)
+        else:
+            decay_params.append(param)
+
+    if not decay_params or not no_decay_params:
+        raise SystemExit(
+            "AdamW param grouping failed: expected both decay and no_decay groups."
+        )
+
+    param_groups = [
+        {"params": decay_params, "weight_decay": float(weight_decay)},
+        {"params": no_decay_params, "weight_decay": 0.0},
+    ]
+    stats = {
+        "decay_tensors": len(decay_params),
+        "no_decay_tensors": len(no_decay_params),
+        "decay_params": sum(p.numel() for p in decay_params),
+        "no_decay_params": sum(p.numel() for p in no_decay_params),
+    }
+    return param_groups, stats
 
 
 def maybe_launch_screen(enabled, session_name):
@@ -588,6 +971,27 @@ def maybe_apply_budget_guard(budget, tokens_per_step):
     return math.ceil(target_tokens / tokens_per_step)
 
 
+def _make_local_checkpoint_dir(output_dir, logical_name, mode):
+    if mode == "ephemeral":
+        temp_root = os.path.join(output_dir, ".tmp_checkpoints")
+        os.makedirs(temp_root, exist_ok=True)
+        return tempfile.mkdtemp(prefix=f"{logical_name}_", dir=temp_root)
+    return os.path.join(output_dir, logical_name)
+
+
+def _cleanup_dir(path):
+    if path and os.path.isdir(path):
+        shutil.rmtree(path, ignore_errors=True)
+
+
+def _persist_ephemeral_checkpoint_dir(checkpoint_dir, output_dir, logical_name):
+    fallback_dir = os.path.join(output_dir, f"{logical_name}_upload_failed")
+    if os.path.exists(fallback_dir):
+        shutil.rmtree(fallback_dir)
+    shutil.move(checkpoint_dir, fallback_dir)
+    return fallback_dir
+
+
 def rotate_checkpoints(output_dir, limit, protected=None):
     """Keep at most `limit` total checkpoints, deleting oldest unprotected first."""
     if limit <= 0:
@@ -785,9 +1189,15 @@ def _get_gpu_stats():
 def _load_checkpoint_manifest(output_dir):
     manifest_path = os.path.join(output_dir, "checkpoint_manifest.json")
     if not os.path.exists(manifest_path):
-        return {"last": None, "best": [], "good_slots": {}, "steps": {}}
+        return {"last": None, "best": [], "good_slots": {}, "steps": {}, "final": None}
     with open(manifest_path, "r", encoding="utf-8") as f:
-        return json.load(f)
+        manifest = json.load(f)
+    manifest.setdefault("last", None)
+    manifest.setdefault("best", [])
+    manifest.setdefault("good_slots", {})
+    manifest.setdefault("steps", {})
+    manifest.setdefault("final", None)
+    return manifest
 
 
 def _save_checkpoint_manifest(output_dir, manifest):
@@ -821,6 +1231,8 @@ def _protected_steps(manifest):
 def _resolve_slot_step(manifest, slot):
     if slot == "last":
         return manifest.get("last")
+    if slot == "final":
+        return "final"
     if slot == "best":
         best = manifest.get("best", [])
         if best:
@@ -1015,11 +1427,11 @@ def run_overfit_microset(
         accelerator,
     )
 
+    overfit_param_groups, _ = build_adamw_param_groups(model, optim_cfg["weight_decay"])
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        overfit_param_groups,
         lr=learning_rate,
         betas=tuple(optim_cfg["betas"]),
-        weight_decay=optim_cfg["weight_decay"],
     )
     lr_scheduler = None
     if warmup_steps and warmup_steps > 0:
@@ -1175,6 +1587,11 @@ def main():
     parser.add_argument("--train_config", default="configs/train.yaml")
     parser.add_argument("--resume_from", default=None)
     parser.add_argument("--resume_from_slot", default=None)
+    parser.add_argument(
+        "--resume_from_hf",
+        default=None,
+        help="Resume from remote HF checkpoint selector: latest|best|final|step_XXXXXXX",
+    )
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--launch_screen", action="store_true")
     parser.add_argument("--screen_name", default=None)
@@ -1264,6 +1681,17 @@ def main():
     output_dir = optim_cfg["output_dir"]
     os.makedirs(output_dir, exist_ok=True)
 
+    artifact_manifest = _build_artifact_manifest(
+        args.model_config,
+        args.train_config,
+        model_cfg,
+        train_cfg,
+        data_cfg,
+    )
+    artifact_manifest_path = None
+    if accelerator.is_main_process:
+        artifact_manifest_path = _save_artifact_manifest(output_dir, artifact_manifest)
+
     # Set up file logging (only on main process)
     cleanup_logging = lambda: None
     if accelerator.is_main_process:
@@ -1294,6 +1722,36 @@ def main():
     best_slots = max(0, int(checkpoint_cfg.get("best", 2)))
     good_slots = list(checkpoint_cfg.get("good", ["good_1", "good_2"]) or [])
     checkpoint_uploader = CheckpointUploader(checkpoint_upload_cfg) if accelerator.is_main_process else None
+    local_checkpoint_mode = str(checkpoint_upload_cfg.get("local_checkpoint_mode", "persistent")).lower()
+    if local_checkpoint_mode not in {"persistent", "ephemeral"}:
+        raise SystemExit(
+            "checkpoint_upload.local_checkpoint_mode must be one of: persistent, ephemeral"
+        )
+    keep_local_final = bool(
+        checkpoint_upload_cfg.get("keep_local_final", local_checkpoint_mode != "ephemeral")
+    )
+    if local_checkpoint_mode == "ephemeral" and not (
+        checkpoint_uploader and checkpoint_uploader.enabled
+    ):
+        raise SystemExit(
+            "local_checkpoint_mode=ephemeral requires checkpoint_upload.enabled=true "
+            "with a valid repo_id."
+        )
+    artifact_upload_files = []
+    if accelerator.is_main_process:
+        artifact_upload_files = _collect_artifact_upload_files(
+            artifact_manifest,
+            artifact_manifest_path,
+            args.model_config,
+            args.train_config,
+        )
+    if checkpoint_uploader and checkpoint_uploader.enabled and artifact_upload_files:
+        artifacts_ok = checkpoint_uploader.upload_artifacts(artifact_upload_files)
+        if not artifacts_ok:
+            raise SystemExit(
+                "Failed to upload required run artifacts to HuggingFace. "
+                "Aborting to avoid unreproducible checkpoints."
+            )
 
     model_prepared = False
     if overfit_cfg.get("enabled", False) and (not args.smoke or overfit_cfg.get("run_on_smoke", False)):
@@ -1303,11 +1761,19 @@ def main():
     elif accelerator.is_main_process and overfit_cfg.get("enabled", False) and args.smoke:
         print("[overfit check] skipped on smoke run.")
 
+    adamw_param_groups, adamw_stats = build_adamw_param_groups(model, optim_cfg["weight_decay"])
+    if accelerator.is_main_process:
+        print(
+            "[optimizer] AdamW groups: "
+            f"decay={adamw_stats['decay_tensors']} tensors "
+            f"({adamw_stats['decay_params'] / 1e6:.2f}M params), "
+            f"no_decay={adamw_stats['no_decay_tensors']} tensors "
+            f"({adamw_stats['no_decay_params'] / 1e6:.2f}M params)"
+        )
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        adamw_param_groups,
         lr=optim_cfg["learning_rate"],
         betas=tuple(optim_cfg["betas"]),
-        weight_decay=optim_cfg["weight_decay"],
     )
 
     lr_scheduler = get_cosine_schedule_with_warmup(
@@ -1330,12 +1796,35 @@ def main():
     )
 
     resume_path = args.resume_from
+    resume_from_hf = args.resume_from_hf or checkpoint_upload_cfg.get("resume_from_hf")
     if args.resume_from_slot:
         slot_step = _resolve_slot_step(manifest, args.resume_from_slot)
         if not slot_step:
             raise SystemExit(f"resume_from_slot '{args.resume_from_slot}' not found in manifest.")
         resume_path = os.path.join(output_dir, slot_step)
+    if resume_path and not os.path.isdir(resume_path):
+        resume_basename = os.path.basename(os.path.normpath(resume_path))
+        can_try_hf = resume_basename == "final" or _parse_step_name(resume_basename) is not None
+        if checkpoint_uploader and checkpoint_uploader.enabled and can_try_hf:
+            resume_path = checkpoint_uploader.download_checkpoint(resume_basename, output_dir)
+            print(f"[resume] Downloaded remote checkpoint '{resume_basename}' to {resume_path}")
+        else:
+            raise SystemExit(f"Resume checkpoint not found locally: {resume_path}")
+    if not resume_path and resume_from_hf:
+        if not (checkpoint_uploader and checkpoint_uploader.enabled):
+            raise SystemExit(
+                "resume_from_hf requested but checkpoint_upload is not enabled/configured."
+            )
+        resolved_step = checkpoint_uploader.resolve_remote_step(resume_from_hf, manifest)
+        if not resolved_step:
+            raise SystemExit(
+                f"Could not resolve remote checkpoint selector '{resume_from_hf}' "
+                f"in repo '{checkpoint_uploader.repo_id}'."
+            )
+        resume_path = checkpoint_uploader.download_checkpoint(resolved_step, output_dir)
+        print(f"[resume] Downloaded remote checkpoint '{resolved_step}' to {resume_path}")
     if resume_path:
+        print(f"[resume] Loading state from {resume_path}")
         accelerator.load_state(resume_path)
 
     rng = np.random.default_rng(optim_cfg["seed"] + accelerator.process_index)
@@ -1397,7 +1886,9 @@ def main():
                     step_dir = target
                 if not step_dir:
                     continue
-                if not os.path.isdir(os.path.join(output_dir, step_dir)):
+                local_exists = os.path.isdir(os.path.join(output_dir, step_dir))
+                known_step = step_dir in (manifest.get("steps") or {}) or step_dir == "final"
+                if not local_exists and not known_step:
                     continue
                 manifest.setdefault("good_slots", {})[slot] = step_dir
                 _save_checkpoint_manifest(output_dir, manifest)
@@ -1486,52 +1977,118 @@ def main():
 
         if step % optim_cfg["save_interval"] == 0 or save_requested:
             ckpt_dir_name = f"step_{step:07d}"
-            ckpt_dir = os.path.join(output_dir, ckpt_dir_name)
+            ckpt_dir = _make_local_checkpoint_dir(output_dir, ckpt_dir_name, local_checkpoint_mode)
             accelerator.wait_for_everyone()
             accelerator.save_state(ckpt_dir)
             if accelerator.is_main_process:
                 unwrapped = accelerator.unwrap_model(model)
                 torch.save(unwrapped.state_dict(), os.path.join(ckpt_dir, "model.pt"))
+
+                should_upload = bool(
+                    checkpoint_uploader
+                    and checkpoint_uploader.enabled
+                    and (
+                        local_checkpoint_mode == "ephemeral"
+                        or checkpoint_uploader.should_upload(step)
+                    )
+                )
+                uploaded_ok = False
+                if should_upload:
+                    uploaded_ok = checkpoint_uploader.upload(ckpt_dir, step)
+
                 manifest["last"] = ckpt_dir_name
                 manifest.setdefault("steps", {})[ckpt_dir_name] = {
                     "step": step,
                     "val_loss": last_val_loss,
                     "timestamp": time.time(),
+                    "uploaded": bool(uploaded_ok),
+                    "local_path": ckpt_dir_name if local_checkpoint_mode == "persistent" else None,
                 }
                 if best_slots > 0:
                     _update_best_slots(manifest, ckpt_dir_name, last_val_loss, best_slots)
                 _save_checkpoint_manifest(output_dir, manifest)
-                
-                # Upload checkpoint to HuggingFace if configured
-                if checkpoint_uploader and checkpoint_uploader.should_upload(step):
-                    checkpoint_uploader.upload(ckpt_dir, step)
-                
-                rotate_checkpoints(
-                    output_dir,
-                    optim_cfg["checkpoint_limit"],
-                    protected=_protected_steps(manifest),
-                )
+
+                if should_upload and uploaded_ok:
+                    checkpoint_uploader.prune_remote(manifest)
+
+                if local_checkpoint_mode == "ephemeral":
+                    if should_upload and uploaded_ok:
+                        _cleanup_dir(ckpt_dir)
+                    else:
+                        persisted = _persist_ephemeral_checkpoint_dir(
+                            ckpt_dir, output_dir, ckpt_dir_name
+                        )
+                        raise SystemExit(
+                            "HF checkpoint upload failed in ephemeral mode. "
+                            f"Saved local recovery checkpoint at: {persisted}"
+                        )
+                else:
+                    if should_upload and not uploaded_ok:
+                        print(
+                            "[checkpoint_upload] Warning: upload failed, keeping local "
+                            f"checkpoint at {ckpt_dir}"
+                        )
+                    rotate_checkpoints(
+                        output_dir,
+                        optim_cfg["checkpoint_limit"],
+                        protected=_protected_steps(manifest),
+                    )
 
         if stop_training:
             break
 
     accelerator.wait_for_everyone()
     final_dir = os.path.join(output_dir, "final")
+    if local_checkpoint_mode == "ephemeral" and not keep_local_final:
+        final_dir = _make_local_checkpoint_dir(output_dir, "final", local_checkpoint_mode)
     accelerator.save_state(final_dir)
     if accelerator.is_main_process:
         unwrapped = accelerator.unwrap_model(model)
         torch.save(unwrapped.state_dict(), os.path.join(final_dir, "model.pt"))
         print(f"Saved final checkpoint to {final_dir}")
-        
-        # Upload final checkpoint and logs to HuggingFace
+
+        final_uploaded = False
         if checkpoint_uploader and checkpoint_uploader.enabled:
-            checkpoint_uploader.upload(final_dir, step, is_final=True)
+            final_uploaded = checkpoint_uploader.upload(final_dir, step, is_final=True)
+            if final_uploaded:
+                checkpoint_uploader.prune_remote(manifest)
+
+        manifest["final"] = {
+            "timestamp": time.time(),
+            "uploaded": bool(final_uploaded),
+            "local_path": (
+                "final"
+                if os.path.abspath(final_dir) == os.path.abspath(os.path.join(output_dir, "final"))
+                else None
+            ),
+        }
+        _save_checkpoint_manifest(output_dir, manifest)
+        if checkpoint_uploader and checkpoint_uploader.enabled:
+            if artifact_upload_files:
+                checkpoint_uploader.upload_artifacts(artifact_upload_files)
             checkpoint_uploader.upload_logs(output_dir)
-        
+
+        if local_checkpoint_mode == "ephemeral" and not keep_local_final:
+            if final_uploaded:
+                _cleanup_dir(final_dir)
+            else:
+                persisted = _persist_ephemeral_checkpoint_dir(final_dir, output_dir, "final")
+                raise SystemExit(
+                    "Final checkpoint upload failed in ephemeral mode. "
+                    f"Saved local recovery checkpoint at: {persisted}"
+                )
+        elif not keep_local_final and final_uploaded:
+            _cleanup_dir(final_dir)
+        elif checkpoint_uploader and checkpoint_uploader.enabled and not final_uploaded:
+            raise SystemExit(
+                "Final checkpoint upload failed. "
+                f"Local final checkpoint remains at: {final_dir}"
+            )
+
         # Stop streaming data loader if active
         if streaming_mode:
             train_data.stop()
-        
+
         cleanup_logging()
 
 

@@ -32,8 +32,8 @@ Outputs: `tokenizer/spm.model`, `tokenizer/spm.vocab`, `tokenizer/tokenizer_meta
 
 ## Data preparation
 
-Stream from C4 (30%), Wikipedia (45%), and Project Gutenberg (25%), apply
-aggressive filtering, deduplicate, tokenize, and write memmaps:
+Stream from C4 and Wikipedia, apply aggressive filtering, deduplicate, tokenize,
+and write memmaps:
 
 ```
 python scripts/prepare_data.py \
@@ -49,7 +49,6 @@ The pipeline applies:
 - **C4-specific**: stricter alpha ratio (0.70), punctuation spam, web junk keywords,
   nav patterns, paragraph quality, entropy bounds
 - **Wikipedia-specific**: strip tables/refs/external links, filter list-heavy content
-- **Gutenberg-specific**: strip Project Gutenberg boilerplate, normalize line wrapping
 - **Deduplication**: MinHash near-duplicate removal (85% similarity threshold)
 
 Configure weights and filter params in `configs/train.yaml` under `data_prep`.
@@ -205,6 +204,5 @@ accelerate launch scripts/train.py \
 
 - C4: ODC-By 1.0 + Common Crawl Terms of Use
 - Wikipedia: CC-BY-SA
-- Project Gutenberg (pg19): Public domain (US)
 
 Review dataset terms before commercial use.

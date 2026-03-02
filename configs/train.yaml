@@ -20,10 +20,11 @@ data_prep:
   train_tokens: 2000000000
   val_tokens: 20000000
   
-  # Source weights (should sum to 1.0)
-  # Speed-oriented mix: disable Gutenberg for data prep
-  c4_weight: 0.40
-  wiki_weight: 0.60
+  # Active source weights (should sum to ~1.0 across enabled sources)
+  c4_weight: 0.30
+  wiki_weight: 0.50
+  fineweb_weight: 0.20
+  # Backward-compatible alias; ignored when fineweb_weight is set.
   gutenberg_weight: 0.00
   
   shuffle_buffer: 1000
@@ -48,7 +49,9 @@ data_prep:
   # Wikipedia-specific (W1)
   wiki_max_list_ratio: 0.20
   
-  # Gutenberg-specific (GUT2)
+  # FineWeb-specific (currently no-op; reserved for future tuning)
+  fineweb_filter_poetry: false
+  # Backward-compatible alias
   gutenberg_filter_poetry: false
   
   # Deduplication (G6)
@@ -86,7 +89,7 @@ inference:
 tokenizer_training:
   output_dir: tokenizer
   vocab_size: 32000
-  # Note: Uses c4_weight, wiki_weight, gutenberg_weight from data_prep section
+  # Note: Uses c4/wiki/fineweb weights from data_prep.
   min_chars: 200
   max_chars: 50000000
   shuffle_buffer: 1000
@@ -118,9 +121,18 @@ checkpoint_slots:
 checkpoint_upload:
   enabled: true  # Requires HF_TOKEN or huggingface-cli login
   repo_id: ark296/llama-100m-v2-checkpoints
-  upload_interval: 1000  # Upload every N steps
-  delete_local_after_upload: true  # Free disk space
-  upload_optimizer: false  # Skip optimizer to save space
+  upload_interval: 1000  # Upload every N steps (ignored in ephemeral mode; every save uploads)
+  upload_optimizer: true  # Kept for compatibility; exact-resume mode uploads full checkpoint folders
+  local_checkpoint_mode: ephemeral  # persistent|ephemeral (ephemeral keeps local checkpoints only until upload succeeds)
+  keep_local_final: false  # Keep local final checkpoint after successful upload
+  retry_max_attempts: 3
+  retry_backoff_seconds: 5
+  verify_upload: true
+  resume_from_hf: null  # Optional: latest|best|final|step_XXXXXXX
+  retention:
+    enabled: true
+    keep_latest: 1
+    keep_best: 2
 
 logging:
   enabled: true

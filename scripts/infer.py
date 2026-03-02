@@ -2,9 +2,12 @@
 """Simple inference script for text generation."""
 
 import argparse
+import hashlib
+import json
 import os
 import torch
 import sentencepiece as spm
+from huggingface_hub import hf_hub_download
 from transformers import LlamaForCausalLM, LlamaConfig
 import yaml
 
@@ -13,12 +16,12 @@ DEFAULT_CONFIG = "configs/train.yaml"
 
 
 def load_config(config_path):
-    """Load inference config from yaml file."""
+    """Load full train config yaml file."""
     if not os.path.exists(config_path):
         return {}
     with open(config_path) as f:
-        full_cfg = yaml.safe_load(f)
-    return full_cfg.get("inference", {})
+        full_cfg = yaml.safe_load(f) or {}
+    return full_cfg
 
 
 def load_model(checkpoint_path, model_config_path, device):
@@ -54,6 +57,99 @@ def load_model(checkpoint_path, model_config_path, device):
     model.eval()
     
     return model, config
+
+
+def _file_sha256(path, chunk_size=1024 * 1024):
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _load_json_if_exists(path):
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _find_artifact_manifest_path(checkpoint_dir):
+    parent = os.path.dirname(os.path.normpath(checkpoint_dir))
+    candidates = [
+        os.path.join(checkpoint_dir, "artifacts_manifest.json"),
+        os.path.join(checkpoint_dir, "artifacts", "artifacts_manifest.json"),
+        os.path.join(parent, "artifacts_manifest.json"),
+        os.path.join(parent, "artifacts", "artifacts_manifest.json"),
+    ]
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def _load_artifact_manifest(checkpoint_dir, repo_id):
+    local_manifest = _find_artifact_manifest_path(checkpoint_dir)
+    if local_manifest:
+        return _load_json_if_exists(local_manifest), local_manifest
+    if not repo_id:
+        return None, None
+
+    cache_dir = os.path.join(os.path.dirname(os.path.normpath(checkpoint_dir)), ".hf_artifacts")
+    try:
+        manifest_path = hf_hub_download(
+            repo_id=repo_id,
+            filename="artifacts/artifacts_manifest.json",
+            repo_type="model",
+            local_dir=cache_dir,
+        )
+    except Exception:
+        return None, None
+    return _load_json_if_exists(manifest_path), manifest_path
+
+
+def _validate_artifacts_or_die(artifact_manifest, tokenizer_path, model_config_path):
+    errors = []
+    tokenizer_info = artifact_manifest.get("tokenizer") or {}
+    expected_tokenizer_sha = tokenizer_info.get("sha256")
+    if expected_tokenizer_sha:
+        if not os.path.exists(tokenizer_path):
+            errors.append(f"tokenizer model missing at '{tokenizer_path}'")
+        else:
+            actual_tokenizer_sha = _file_sha256(tokenizer_path)
+            if actual_tokenizer_sha != expected_tokenizer_sha:
+                errors.append(
+                    "tokenizer sha256 mismatch: "
+                    f"expected={expected_tokenizer_sha}, got={actual_tokenizer_sha}"
+                )
+
+    model_cfg_info = artifact_manifest.get("model_config") or {}
+    expected_model_cfg_sha = model_cfg_info.get("sha256")
+    if expected_model_cfg_sha:
+        if not os.path.exists(model_config_path):
+            errors.append(f"model config missing at '{model_config_path}'")
+        else:
+            actual_model_cfg_sha = _file_sha256(model_config_path)
+            if actual_model_cfg_sha != expected_model_cfg_sha:
+                errors.append(
+                    "model config sha256 mismatch: "
+                    f"expected={expected_model_cfg_sha}, got={actual_model_cfg_sha}"
+                )
+
+    if errors:
+        detail = "\n- ".join(errors)
+        raise SystemExit(
+            "Artifact validation failed. Refusing to run inference with mismatched artifacts.\n"
+            f"- {detail}\n"
+            "Use the checkpoint's matching tokenizer/config, or rerun with --skip_artifact_validation "
+            "only if you intentionally accept invalid outputs."
+        )
 
 
 def _truncate_at_eos(token_ids, eos_id):
@@ -147,22 +243,29 @@ def main():
     parser.add_argument("--repetition_penalty", type=float, default=None, help="Repetition penalty (1.0=none, 1.2=moderate)")
     parser.add_argument("--device", type=str, default=None, help="Device (auto/cuda/cpu)")
     parser.add_argument("--repl", action="store_true", help="Interactive REPL mode (keeps model loaded)")
+    parser.add_argument(
+        "--skip_artifact_validation",
+        action="store_true",
+        help="Skip tokenizer/config hash validation against artifacts manifest (not recommended).",
+    )
     args = parser.parse_args()
     
     # Load config file
-    cfg = load_config(args.config)
-    
+    full_cfg = load_config(args.config)
+    inference_cfg = full_cfg.get("inference", {})
+    checkpoint_upload_cfg = full_cfg.get("checkpoint_upload", {})
+
     # Merge config with CLI args (CLI takes precedence)
-    checkpoint = args.checkpoint or cfg.get("checkpoint", "runs/llama-100m/final")
-    model_config = args.model_config or cfg.get("model_config", "configs/model_100m.yaml")
-    tokenizer_path = args.tokenizer or cfg.get("tokenizer", "tokenizer/spm.model")
-    prompt = args.prompt or cfg.get("prompt", "The quick brown fox")
-    max_tokens = args.max_tokens if args.max_tokens is not None else cfg.get("max_tokens", 100)
-    temperature = args.temperature if args.temperature is not None else cfg.get("temperature", 0.8)
-    top_p = args.top_p if args.top_p is not None else cfg.get("top_p", 0.95)
-    top_k = args.top_k if args.top_k is not None else cfg.get("top_k", 50)
-    repetition_penalty = args.repetition_penalty if args.repetition_penalty is not None else cfg.get("repetition_penalty", 1.2)
-    device_cfg = args.device or cfg.get("device", "auto")
+    checkpoint = args.checkpoint or inference_cfg.get("checkpoint", "runs/llama-100m/final")
+    model_config = args.model_config or inference_cfg.get("model_config", "configs/model_100m.yaml")
+    tokenizer_path = args.tokenizer or inference_cfg.get("tokenizer", "tokenizer/spm.model")
+    prompt = args.prompt or inference_cfg.get("prompt", "The quick brown fox")
+    max_tokens = args.max_tokens if args.max_tokens is not None else inference_cfg.get("max_tokens", 100)
+    temperature = args.temperature if args.temperature is not None else inference_cfg.get("temperature", 0.8)
+    top_p = args.top_p if args.top_p is not None else inference_cfg.get("top_p", 0.95)
+    top_k = args.top_k if args.top_k is not None else inference_cfg.get("top_k", 50)
+    repetition_penalty = args.repetition_penalty if args.repetition_penalty is not None else inference_cfg.get("repetition_penalty", 1.2)
+    device_cfg = args.device or inference_cfg.get("device", "auto")
     
     # Auto-detect device
     if device_cfg == "auto" or device_cfg is None:
@@ -170,6 +273,18 @@ def main():
     else:
         device = device_cfg
     print(f"Using device: {device}")
+
+    if not args.skip_artifact_validation:
+        repo_id = checkpoint_upload_cfg.get("repo_id")
+        artifact_manifest, manifest_source = _load_artifact_manifest(checkpoint, repo_id)
+        if artifact_manifest is None:
+            raise SystemExit(
+                "Missing artifacts manifest for checkpoint validation. "
+                "Expected local artifacts_manifest.json or remote "
+                "'artifacts/artifacts_manifest.json' in checkpoint_upload.repo_id."
+            )
+        _validate_artifacts_or_die(artifact_manifest, tokenizer_path, model_config)
+        print(f"[artifact] validated with {manifest_source}")
     
     # Load tokenizer
     print("Loading tokenizer...")

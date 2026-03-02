@@ -125,6 +125,13 @@ uv run train --launch_screen
 uv run train --resume_from runs/llama-100m/checkpoint-XXXXX
 ```
 
+### Resume from HuggingFace checkpoint
+```bash
+uv run train --resume_from_hf latest
+uv run train --resume_from_hf best
+uv run train --resume_from_hf step_0007000
+```
+
 ### Run smoke test
 ```bash
 uv run train --smoke
@@ -139,6 +146,19 @@ uv run eval
 ```bash
 less +F runs/llama-100m/train.log
 ```
+
+## HF-First Checkpointing (Recommended)
+
+- Use `checkpoint_upload.enabled: true` with a valid `repo_id`.
+- Prefer `checkpoint_upload.local_checkpoint_mode: ephemeral` to minimize local disk usage.
+- Keep exact-resume safety by uploading full Accelerate checkpoint folders (model + optimizer/scheduler/RNG state).
+- Always preserve and upload run artifacts:
+  - tokenizer model (`spm.model`)
+  - model config
+  - train config
+  - data meta (`data_meta.json`) with tokenizer fingerprint
+  - `artifacts_manifest.json`
+- Evaluate/infer scripts validate artifact hashes by default; mismatches should fail fast instead of generating misleading outputs.
 
 ## Dependencies
 
