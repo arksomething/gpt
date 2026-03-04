@@ -32,11 +32,13 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Iterator, List, Optional
+from typing import Callable, Iterator, List, Optional
 
 import numpy as np
 import sentencepiece as spm
@@ -190,14 +192,93 @@ def load_checkpoint(checkpoint_path: str) -> Optional[Checkpoint]:
 
 
 def save_checkpoint(checkpoint: Checkpoint, checkpoint_path: str):
-    """Save checkpoint to disk."""
-    with open(checkpoint_path, "w", encoding="utf-8") as f:
+    """Save checkpoint atomically to disk."""
+    tmp_path = f"{checkpoint_path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(checkpoint.to_dict(), f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, checkpoint_path)
 
 
 # =============================================================================
 # Data Loading and Streaming
 # =============================================================================
+
+
+def _stream_with_retries(
+    label: str,
+    dataset_factory: Callable[[], Iterator[dict]],
+    text_extractor: Callable[[dict], Optional[str]],
+) -> Iterator[str]:
+    """Yield text docs with retry+fast-forward on transient stream failures."""
+    max_retries = int(os.environ.get("DATA_STREAM_MAX_RETRIES", "12") or 12)
+    base_delay = float(os.environ.get("DATA_STREAM_RETRY_BASE_SEC", "1.0") or 1.0)
+
+    seen_examples = 0
+    yielded_docs = 0
+    attempt = 0
+
+    while True:
+        ds = None
+        iterator = None
+        try:
+            ds = dataset_factory()
+            iterator = iter(ds)
+
+            if seen_examples > 0:
+                print(
+                    f"[{label}] Recovering stream, fast-forwarding {seen_examples:,} examples...",
+                    flush=True,
+                )
+                skipped = 0
+                while skipped < seen_examples:
+                    next(iterator)
+                    skipped += 1
+                    if skipped % 100000 == 0:
+                        print(f"[{label}] Fast-forwarded {skipped:,}/{seen_examples:,}", flush=True)
+
+            for example in iterator:
+                seen_examples += 1
+                text = text_extractor(example)
+                if not text:
+                    continue
+                yielded_docs += 1
+                attempt = 0
+                if yielded_docs == 1:
+                    print(f"[{label}] First document yielded", flush=True)
+                elif yielded_docs % 5000 == 0:
+                    print(f"[{label}] {yielded_docs:,} docs", flush=True)
+                yield text
+            return
+        except StopIteration:
+            return
+        except Exception as exc:
+            attempt += 1
+            if attempt > max_retries:
+                raise RuntimeError(
+                    f"[{label}] Stream failed after {max_retries} retries."
+                ) from exc
+            delay = min(60.0, base_delay * (2 ** (attempt - 1)))
+            print(
+                f"[{label}] Stream error after {yielded_docs:,} docs ({seen_examples:,} examples): "
+                f"{exc}. Retrying {attempt}/{max_retries} in {delay:.1f}s",
+                flush=True,
+            )
+            time.sleep(delay)
+        finally:
+            close_iter = getattr(iterator, "close", None)
+            if callable(close_iter):
+                try:
+                    close_iter()
+                except Exception:
+                    pass
+            close_ds = getattr(ds, "close", None)
+            if callable(close_ds):
+                try:
+                    close_ds()
+                except Exception:
+                    pass
 
 
 def stream_fineweb(seed: int = 42) -> Iterator[str]:
@@ -208,30 +289,29 @@ def stream_fineweb(seed: int = 42) -> Iterator[str]:
     text_field = os.environ.get("FINEWEB_TEXT_FIELD", "text")
     shuffle_buffer = int(os.environ.get("FINEWEB_SHUFFLE_BUFFER", "0") or 0)
 
-    print(
-        f"[fineweb] Loading dataset repo={repo} config={config} split={split}...",
-        flush=True,
-    )
-    if config:
-        ds = load_dataset(repo, config, split=split, streaming=True)
-    else:
-        ds = load_dataset(repo, split=split, streaming=True)
-    if shuffle_buffer > 1:
-        ds = ds.shuffle(seed=seed, buffer_size=shuffle_buffer)
-        print(f"[fineweb] Starting iteration (shuffle buffer={shuffle_buffer})...", flush=True)
-    else:
-        print("[fineweb] Starting iteration (no shuffle)...", flush=True)
+    def dataset_factory():
+        print(
+            f"[fineweb] Loading dataset repo={repo} config={config} split={split}...",
+            flush=True,
+        )
+        if config:
+            ds = load_dataset(repo, config, split=split, streaming=True)
+        else:
+            ds = load_dataset(repo, split=split, streaming=True)
+        if shuffle_buffer > 1:
+            ds = ds.shuffle(seed=seed, buffer_size=shuffle_buffer)
+            print(f"[fineweb] Starting iteration (shuffle buffer={shuffle_buffer})...", flush=True)
+        else:
+            print("[fineweb] Starting iteration (no shuffle)...", flush=True)
+        return ds
 
-    count = 0
-    for example in ds:
+    def extract_text(example: dict) -> Optional[str]:
         text = example.get(text_field) if isinstance(example, dict) else None
         if isinstance(text, str) and text.strip():
-            yield text
-            count += 1
-            if count == 1:
-                print("[fineweb] First document yielded", flush=True)
-            elif count % 5000 == 0:
-                print(f"[fineweb] {count:,} docs", flush=True)
+            return text
+        return None
+
+    yield from _stream_with_retries("fineweb", dataset_factory, extract_text)
 
 
 def stream_gutenberg(seed: int = 42) -> Iterator[str]:
@@ -348,42 +428,48 @@ class ShuffleBuffer:
 
 def stream_c4(seed: int = 42) -> Iterator[str]:
     """Stream text from C4 dataset."""
-    print("[c4] Loading dataset...", flush=True)
-    ds = load_dataset(
-        "allenai/c4",
-        "en",
-        split="train",
-        streaming=True,
-    )
-    print("[c4] Starting iteration (no shuffle)...", flush=True)
-    count = 0
-    for example in ds:
-        yield example["text"]
-        count += 1
-        if count == 1:
-            print(f"[c4] First document yielded", flush=True)
-        elif count % 5000 == 0:
-            print(f"[c4] {count:,} docs", flush=True)
+    def dataset_factory():
+        print("[c4] Loading dataset...", flush=True)
+        ds = load_dataset(
+            "allenai/c4",
+            "en",
+            split="train",
+            streaming=True,
+        )
+        print("[c4] Starting iteration (no shuffle)...", flush=True)
+        return ds
+
+    def extract_text(example: dict) -> Optional[str]:
+        text = example.get("text") if isinstance(example, dict) else None
+        if isinstance(text, str) and text.strip():
+            return text
+        return None
+
+    _ = seed
+    yield from _stream_with_retries("c4", dataset_factory, extract_text)
 
 
 def stream_wikipedia(seed: int = 42) -> Iterator[str]:
     """Stream text from Wikipedia dataset."""
-    print("[wiki] Loading dataset...", flush=True)
-    ds = load_dataset(
-        "wikimedia/wikipedia",
-        "20231101.en",
-        split="train",
-        streaming=True,
-    )
-    print("[wiki] Starting iteration (no shuffle)...", flush=True)
-    count = 0
-    for example in ds:
-        yield example["text"]
-        count += 1
-        if count == 1:
-            print(f"[wiki] First document yielded", flush=True)
-        elif count % 5000 == 0:
-            print(f"[wiki] {count:,} docs", flush=True)
+    def dataset_factory():
+        print("[wiki] Loading dataset...", flush=True)
+        ds = load_dataset(
+            "wikimedia/wikipedia",
+            "20231101.en",
+            split="train",
+            streaming=True,
+        )
+        print("[wiki] Starting iteration (no shuffle)...", flush=True)
+        return ds
+
+    def extract_text(example: dict) -> Optional[str]:
+        text = example.get("text") if isinstance(example, dict) else None
+        if isinstance(text, str) and text.strip():
+            return text
+        return None
+
+    _ = seed
+    yield from _stream_with_retries("wiki", dataset_factory, extract_text)
 
 
 # =============================================================================
@@ -512,53 +598,62 @@ def interleave_sources(
     wiki_exhausted = wiki_weight <= 0
     fineweb_exhausted = fineweb_weight <= 0
 
-    while True:
-        if c4_exhausted and wiki_exhausted and fineweb_exhausted:
-            break
+    try:
+        while True:
+            if c4_exhausted and wiki_exhausted and fineweb_exhausted:
+                break
 
-        available_weight = 0.0
-        if not c4_exhausted:
-            available_weight += c4_weight
-        if not wiki_exhausted:
-            available_weight += wiki_weight
-        if not fineweb_exhausted:
-            available_weight += fineweb_weight
+            available_weight = 0.0
+            if not c4_exhausted:
+                available_weight += c4_weight
+            if not wiki_exhausted:
+                available_weight += wiki_weight
+            if not fineweb_exhausted:
+                available_weight += fineweb_weight
 
-        if available_weight == 0:
-            break
+            if available_weight == 0:
+                break
 
-        roll = rng.random() * available_weight
-        cumulative = 0.0
-        selected = None
+            roll = rng.random() * available_weight
+            cumulative = 0.0
+            selected = None
 
-        if not c4_exhausted:
-            cumulative += c4_weight
-            if roll < cumulative:
-                selected = "c4"
-        if selected is None and not wiki_exhausted:
-            cumulative += wiki_weight
-            if roll < cumulative:
-                selected = "wiki"
-        if selected is None and not fineweb_exhausted:
-            selected = "fineweb"
+            if not c4_exhausted:
+                cumulative += c4_weight
+                if roll < cumulative:
+                    selected = "c4"
+            if selected is None and not wiki_exhausted:
+                cumulative += wiki_weight
+                if roll < cumulative:
+                    selected = "wiki"
+            if selected is None and not fineweb_exhausted:
+                selected = "fineweb"
 
-        try:
-            if selected == "c4":
-                text = next(c4_iter)
-                yield ("c4", text)
-            elif selected == "wiki":
-                text = next(wiki_iter)
-                yield ("wiki", text)
-            elif selected == "fineweb":
-                text = next(fineweb_iter)
-                yield ("fineweb", text)
-        except StopIteration:
-            if selected == "c4":
-                c4_exhausted = True
-            elif selected == "wiki":
-                wiki_exhausted = True
-            elif selected == "fineweb":
-                fineweb_exhausted = True
+            try:
+                if selected == "c4":
+                    text = next(c4_iter)
+                    yield ("c4", text)
+                elif selected == "wiki":
+                    text = next(wiki_iter)
+                    yield ("wiki", text)
+                elif selected == "fineweb":
+                    text = next(fineweb_iter)
+                    yield ("fineweb", text)
+            except StopIteration:
+                if selected == "c4":
+                    c4_exhausted = True
+                elif selected == "wiki":
+                    wiki_exhausted = True
+                elif selected == "fineweb":
+                    fineweb_exhausted = True
+    finally:
+        for source_iter in (c4_iter, wiki_iter, fineweb_iter):
+            close_iter = getattr(source_iter, "close", None)
+            if callable(close_iter):
+                try:
+                    close_iter()
+                except Exception:
+                    pass
 
 
 # =============================================================================
@@ -588,6 +683,69 @@ class GracefulInterrupt:
         self.interrupted = True
 
 
+def count_tokens_in_file(path: str, dtype: np.dtype, cap_at: Optional[int] = None) -> int:
+    """Return aligned token count for an existing binary file."""
+    if not os.path.exists(path):
+        return 0
+    bytes_per_token = np.dtype(dtype).itemsize
+    size = os.path.getsize(path)
+    aligned = size - (size % bytes_per_token)
+    if aligned != size:
+        print(
+            f"[resume] Truncating partial token bytes in {path}: "
+            f"{size} -> {aligned} bytes",
+            flush=True,
+        )
+        os.truncate(path, aligned)
+        size = aligned
+
+    tokens = size // bytes_per_token
+    if cap_at is not None and tokens > cap_at:
+        print(
+            f"[resume] Existing file has {tokens:,} tokens > target {cap_at:,}; truncating.",
+            flush=True,
+        )
+        os.truncate(path, cap_at * bytes_per_token)
+        tokens = cap_at
+    return int(tokens)
+
+
+_TOKENIZER_TLS = threading.local()
+_SHORT_DOC_UNK_TOKEN_LIMIT = 200
+
+
+def _tokenize_chunk_worker(
+    text: str,
+    tokenizer_model_path: str,
+    max_unk_ratio: float,
+    short_doc_unk_limit: int,
+) -> tuple[Optional[List[int]], bool]:
+    """
+    Tokenize a chunk in a worker thread.
+    Returns (tokens_or_none, rejected_for_unk).
+    """
+    sp = getattr(_TOKENIZER_TLS, "sp", None)
+    loaded_model = getattr(_TOKENIZER_TLS, "model_path", None)
+    if sp is None or loaded_model != tokenizer_model_path:
+        sp = spm.SentencePieceProcessor()
+        sp.load(tokenizer_model_path)
+        _TOKENIZER_TLS.sp = sp
+        _TOKENIZER_TLS.model_path = tokenizer_model_path
+        _TOKENIZER_TLS.unk_id = sp.unk_id()
+
+    unk_id = _TOKENIZER_TLS.unk_id
+    tokens = sp.encode(text, out_type=int)
+    if not tokens:
+        return None, False
+
+    unk_count = sum(1 for t in tokens if t == unk_id)
+    if unk_count > 0 and unk_count / len(tokens) > max_unk_ratio:
+        return None, True
+    if len(tokens) < short_doc_unk_limit and unk_count > 0:
+        return None, True
+    return tokens, False
+
+
 def write_tokens_to_memmap(
     tokens_iter: Iterator[List[int]],
     output_path: str,
@@ -599,92 +757,138 @@ def write_tokens_to_memmap(
     log_interval: int = 30,
     stats: Optional[dict] = None,
     interrupt_handler: Optional[GracefulInterrupt] = None,
+    phase: str = "train",
+    resume_existing_tokens: int = 0,
 ) -> tuple:
     """
-    Write tokenized documents to memory-mapped file.
+    Write tokenized documents to binary file with crash-safe append semantics.
     Returns (actual_tokens, was_interrupted).
     """
-    buffer_size = target_tokens + target_tokens // 10
-    mmap = np.memmap(output_path, dtype=dtype, mode="w+", shape=(buffer_size,))
-
-    position = 0
+    bytes_per_token = np.dtype(dtype).itemsize
+    mode = "ab" if resume_existing_tokens > 0 else "wb"
+    position = resume_existing_tokens
     doc_count = 0
     last_log_time = time.time()
     last_checkpoint_time = time.time()
     start_time = time.time()
     was_interrupted = False
+    replayed_tokens = 0
 
-    pbar = tqdm(total=target_tokens, desc="Tokens", unit="tok", unit_scale=True)
+    pbar = tqdm(
+        total=target_tokens,
+        initial=min(position, target_tokens),
+        desc="Tokens",
+        unit="tok",
+        unit_scale=True,
+    )
 
-    try:
-        for tokens in tokens_iter:
-            if position >= target_tokens:
-                break
-            
-            # Check for interrupt
-            if interrupt_handler and interrupt_handler.interrupted:
-                was_interrupted = True
-                break
-
-            doc_len = len(tokens)
-            if position + doc_len + 1 > buffer_size:
-                new_size = buffer_size + max(doc_len + 1, buffer_size // 2)
-                mmap.flush()
-                del mmap
-                mmap = np.memmap(output_path, dtype=dtype, mode="r+", shape=(new_size,))
-                buffer_size = new_size
-
-            mmap[position : position + doc_len] = tokens
-            position += doc_len
-            mmap[position] = eos_token_id
-            position += 1
-
-            doc_count += 1
-            pbar.update(doc_len + 1)
-
-            now = time.time()
-            
-            # Progress logging
-            if now - last_log_time >= log_interval:
-                elapsed = now - start_time
-                tps = position / elapsed if elapsed > 0 else 0
-                eta = (target_tokens - position) / tps if tps > 0 else 0
+    with open(output_path, mode) as f:
+        try:
+            if resume_existing_tokens > 0:
                 print(
-                    f"[data] {position:,}/{target_tokens:,} tokens "
-                    f"({position/target_tokens*100:.1f}%) | "
-                    f"{doc_count:,} docs | "
-                    f"{tps:,.0f} tok/s | "
-                    f"ETA: {eta/60:.1f}min"
+                    f"[resume] Replaying {resume_existing_tokens:,} existing tokens "
+                    "to rebuild filter/dedup state...",
+                    flush=True,
                 )
-                last_log_time = now
-            
-            # Checkpointing
-            if now - last_checkpoint_time >= checkpoint_interval:
-                checkpoint = Checkpoint(
-                    phase="train",
-                    tokens_written=position,
-                    docs_processed=doc_count,
-                    c4_docs=stats["c4"].total_docs if stats else 0,
-                    wiki_docs=stats["wiki"].total_docs if stats else 0,
-                    fineweb_docs=stats["fineweb"].total_docs if stats else 0,
-                    dedup_rejects=stats.get("dedup_rejects", 0) if stats else 0,
-                    elapsed_seconds=elapsed,
-                    timestamp=datetime.utcnow().isoformat() + "Z",
+                while replayed_tokens < resume_existing_tokens:
+                    tokens = next(tokens_iter)
+                    replayed_tokens += len(tokens) + 1
+                    doc_count += 1
+                    if replayed_tokens > resume_existing_tokens:
+                        raise SystemExit(
+                            "Resume mismatch: regenerated stream does not align with existing output. "
+                            "Use --overwrite to restart cleanly."
+                        )
+                print(
+                    f"[resume] Replay complete at {replayed_tokens:,} tokens.",
+                    flush=True,
                 )
-                save_checkpoint(checkpoint, checkpoint_path)
-                last_checkpoint_time = now
 
-    finally:
-        pbar.close()
+            for tokens in tokens_iter:
+                if position >= target_tokens:
+                    break
 
-    # Truncate to actual size
-    mmap.flush()
-    del mmap
-    
-    # Actually truncate the file (memmap doesn't shrink files)
-    import os
-    bytes_per_token = np.dtype(dtype).itemsize
-    os.truncate(output_path, position * bytes_per_token)
+                if interrupt_handler and interrupt_handler.interrupted:
+                    was_interrupted = True
+                    break
+
+                doc_len = len(tokens)
+                write_len = doc_len + 1
+                if position + write_len > target_tokens:
+                    break
+
+                arr = np.empty(write_len, dtype=dtype)
+                arr[:-1] = tokens
+                arr[-1] = eos_token_id
+                f.write(arr.tobytes(order="C"))
+                position += write_len
+                doc_count += 1
+                pbar.update(write_len)
+
+                now = time.time()
+                if now - last_log_time >= log_interval:
+                    elapsed = now - start_time
+                    written_since_start = max(0, position - resume_existing_tokens)
+                    tps = written_since_start / elapsed if elapsed > 0 else 0.0
+                    eta = (target_tokens - position) / tps if tps > 0 else 0.0
+                    print(
+                        f"[data] {position:,}/{target_tokens:,} tokens "
+                        f"({position/target_tokens*100:.1f}%) | "
+                        f"{doc_count:,} docs | "
+                        f"{tps:,.0f} tok/s | "
+                        f"ETA: {eta/60:.1f}min"
+                    )
+                    last_log_time = now
+
+                if now - last_checkpoint_time >= checkpoint_interval:
+                    elapsed = now - start_time
+                    checkpoint = Checkpoint(
+                        phase=phase,
+                        tokens_written=position,
+                        docs_processed=doc_count,
+                        c4_docs=stats["c4"].total_docs if stats else 0,
+                        wiki_docs=stats["wiki"].total_docs if stats else 0,
+                        fineweb_docs=stats["fineweb"].total_docs if stats else 0,
+                        dedup_rejects=stats.get("dedup_rejects", 0) if stats else 0,
+                        elapsed_seconds=elapsed,
+                        timestamp=datetime.utcnow().isoformat() + "Z",
+                    )
+                    save_checkpoint(checkpoint, checkpoint_path)
+                    f.flush()
+                    os.fsync(f.fileno())
+                    last_checkpoint_time = now
+        finally:
+            f.flush()
+            os.fsync(f.fileno())
+            pbar.close()
+
+    # Ensure file length exactly matches token count.
+    expected_bytes = position * bytes_per_token
+    actual_bytes = os.path.getsize(output_path)
+    if actual_bytes != expected_bytes:
+        os.truncate(output_path, expected_bytes)
+
+    if was_interrupted or position < target_tokens:
+        elapsed = time.time() - start_time
+        checkpoint = Checkpoint(
+            phase=phase,
+            tokens_written=position,
+            docs_processed=doc_count,
+            c4_docs=stats["c4"].total_docs if stats else 0,
+            wiki_docs=stats["wiki"].total_docs if stats else 0,
+            fineweb_docs=stats["fineweb"].total_docs if stats else 0,
+            dedup_rejects=stats.get("dedup_rejects", 0) if stats else 0,
+            elapsed_seconds=elapsed,
+            timestamp=datetime.utcnow().isoformat() + "Z",
+        )
+        save_checkpoint(checkpoint, checkpoint_path)
+
+    close_iter = getattr(tokens_iter, "close", None)
+    if callable(close_iter):
+        try:
+            close_iter()
+        except Exception:
+            pass
 
     return position, was_interrupted
 
@@ -698,19 +902,35 @@ def process_and_tokenize(
     shuffle_buffer_size: int = 50000,
     seed: int = 42,
     max_unk_ratio: float = 0.01,
+    tokenizer_workers: int = 1,
+    tokenizer_prefetch: int = 256,
+    tokenizer_model_path: Optional[str] = None,
 ) -> Iterator[List[int]]:
     """Process documents: filter, deduplicate, tokenize."""
     shuffle_buffer = ShuffleBuffer(shuffle_buffer_size, seed)
     dedup_rejects = 0
     unk_rejects = 0
     unk_id = tokenizer.unk_id()  # Usually 0
-    
+
     # For periodic logging
     last_log_time = time.time()
     log_interval = 10  # Log every 10 seconds
     docs_yielded = 0
 
-    def tokenize_and_filter(text: str) -> Optional[List[int]]:
+    tokenizer_workers = max(1, int(tokenizer_workers))
+    tokenizer_prefetch = max(1, int(tokenizer_prefetch))
+    use_parallel_tokenization = (
+        tokenizer_workers > 1
+        and tokenizer_model_path is not None
+        and tokenizer_model_path != ""
+    )
+    if use_parallel_tokenization:
+        print(
+            f"[tokenize] Parallel workers={tokenizer_workers}, prefetch={tokenizer_prefetch}",
+            flush=True,
+        )
+
+    def tokenize_and_filter_local(text: str) -> Optional[List[int]]:
         """Tokenize and reject if too many unknown tokens."""
         nonlocal unk_rejects
         tokens = tokenizer.encode(text, out_type=int)
@@ -726,7 +946,7 @@ def process_and_tokenize(
             unk_rejects += 1
             return None
         return tokens
-    
+
     def log_filter_progress():
         """Log current filter statistics."""
         nonlocal last_log_time
@@ -734,13 +954,12 @@ def process_and_tokenize(
         if now - last_log_time < log_interval:
             return
         last_log_time = now
-        
+
         total_seen = stats["c4"].total_docs + stats["wiki"].total_docs + stats["fineweb"].total_docs
         c4_pass = stats["c4"].passed_docs
         wiki_pass = stats["wiki"].passed_docs
         fineweb_pass = stats["fineweb"].passed_docs
-        total_pass = c4_pass + wiki_pass + fineweb_pass
-        
+
         c4_rate = (c4_pass / stats["c4"].total_docs * 100) if stats["c4"].total_docs > 0 else 0
         wiki_rate = (wiki_pass / stats["wiki"].total_docs * 100) if stats["wiki"].total_docs > 0 else 0
         fineweb_rate = (
@@ -748,7 +967,7 @@ def process_and_tokenize(
             if stats["fineweb"].total_docs > 0
             else 0
         )
-        
+
         print(
             f"[filter] Seen {total_seen:,} docs | "
             f"Passed: C4 {c4_pass:,} ({c4_rate:.1f}%), "
@@ -759,39 +978,108 @@ def process_and_tokenize(
             flush=True
         )
 
-    for source_name, text in source_iter:
-        if source_name == "c4":
-            chunks = filter_and_transform_c4(text, filter_cfg, stats["c4"])
-        elif source_name == "wiki":
-            chunks = filter_and_transform_wiki(text, filter_cfg, stats["wiki"])
-        elif source_name == "fineweb":
-            chunks = filter_and_transform_fineweb(text, filter_cfg, stats["fineweb"])
-        else:
-            continue
-        
-        # Log progress periodically
-        log_filter_progress()
+    pending_futures: deque[Future] = deque()
+    executor: Optional[ThreadPoolExecutor] = None
 
-        for chunk in chunks:
-            if deduplicator is not None and deduplicator.is_duplicate(chunk):
-                dedup_rejects += 1
+    def submit_tokenization(chunk: str):
+        if executor is None:
+            return
+        pending_futures.append(
+            executor.submit(
+                _tokenize_chunk_worker,
+                chunk,
+                tokenizer_model_path,
+                max_unk_ratio,
+                _SHORT_DOC_UNK_TOKEN_LIMIT,
+            )
+        )
+
+    def drain_futures(block: bool) -> Iterator[List[int]]:
+        nonlocal unk_rejects, docs_yielded
+        while pending_futures:
+            future = pending_futures[0]
+            if not block and not future.done():
+                break
+
+            future = pending_futures.popleft()
+            tokens, unk_rejected = future.result()
+            if unk_rejected:
+                unk_rejects += 1
+            if tokens:
+                docs_yielded += 1
+                yield tokens
+
+            if block:
+                break
+
+    try:
+        if use_parallel_tokenization:
+            executor = ThreadPoolExecutor(
+                max_workers=tokenizer_workers,
+                thread_name_prefix="tok",
+            )
+
+        for source_name, text in source_iter:
+            if source_name == "c4":
+                chunks = filter_and_transform_c4(text, filter_cfg, stats["c4"])
+            elif source_name == "wiki":
+                chunks = filter_and_transform_wiki(text, filter_cfg, stats["wiki"])
+            elif source_name == "fineweb":
+                chunks = filter_and_transform_fineweb(text, filter_cfg, stats["fineweb"])
+            else:
                 continue
 
-            result = shuffle_buffer.add_and_maybe_yield(chunk)
-            if result is not None:
-                tokens = tokenize_and_filter(result)
+            # Log progress periodically
+            log_filter_progress()
+
+            for chunk in chunks:
+                if deduplicator is not None and deduplicator.is_duplicate(chunk):
+                    dedup_rejects += 1
+                    continue
+
+                result = shuffle_buffer.add_and_maybe_yield(chunk)
+                if result is None:
+                    continue
+
+                if use_parallel_tokenization:
+                    submit_tokenization(result)
+                    while len(pending_futures) >= tokenizer_prefetch:
+                        yield from drain_futures(block=True)
+                    yield from drain_futures(block=False)
+                else:
+                    tokens = tokenize_and_filter_local(result)
+                    if tokens:
+                        docs_yielded += 1
+                        yield tokens
+
+        for chunk in shuffle_buffer.flush():
+            if use_parallel_tokenization:
+                submit_tokenization(chunk)
+                while len(pending_futures) >= tokenizer_prefetch:
+                    yield from drain_futures(block=True)
+                yield from drain_futures(block=False)
+            else:
+                tokens = tokenize_and_filter_local(chunk)
                 if tokens:
                     docs_yielded += 1
                     yield tokens
 
-    for chunk in shuffle_buffer.flush():
-        tokens = tokenize_and_filter(chunk)
-        if tokens:
-            docs_yielded += 1
-            yield tokens
-
-    stats["dedup_rejects"] = dedup_rejects
-    stats["unk_rejects"] = unk_rejects
+        if use_parallel_tokenization:
+            while pending_futures:
+                yield from drain_futures(block=True)
+    finally:
+        close_source_iter = getattr(source_iter, "close", None)
+        if callable(close_source_iter):
+            try:
+                close_source_iter()
+            except Exception:
+                pass
+        if executor is not None:
+            for future in pending_futures:
+                future.cancel()
+            executor.shutdown(wait=True, cancel_futures=True)
+        stats["dedup_rejects"] = dedup_rejects
+        stats["unk_rejects"] = unk_rejects
 
 
 def main():
@@ -834,6 +1122,18 @@ Examples:
     parser.add_argument("--shuffle_buffer", type=int, default=None, help="Shuffle buffer size")
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
     parser.add_argument("--log_interval", type=int, default=None, help="Seconds between logs")
+    parser.add_argument(
+        "--tokenizer_workers",
+        type=int,
+        default=None,
+        help="Tokenization worker threads (<=0 means auto).",
+    )
+    parser.add_argument(
+        "--tokenizer_prefetch",
+        type=int,
+        default=None,
+        help="Maximum queued tokenization tasks.",
+    )
     
     # Execution options
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing files")
@@ -881,6 +1181,21 @@ Examples:
     shuffle_buffer = args.shuffle_buffer or data_prep_cfg.get("shuffle_buffer", 50000)
     seed = args.seed if args.seed is not None else data_prep_cfg.get("seed", 1337)
     log_interval = args.log_interval or data_prep_cfg.get("log_interval", 30)
+    tokenizer_workers = (
+        args.tokenizer_workers
+        if args.tokenizer_workers is not None
+        else data_prep_cfg.get("tokenizer_workers", 1)
+    )
+    tokenizer_workers = int(tokenizer_workers if tokenizer_workers is not None else 1)
+    if tokenizer_workers <= 0:
+        tokenizer_workers = max(1, min(os.cpu_count() or 1, 16))
+
+    tokenizer_prefetch = (
+        args.tokenizer_prefetch
+        if args.tokenizer_prefetch is not None
+        else data_prep_cfg.get("tokenizer_prefetch", tokenizer_workers * 32)
+    )
+    tokenizer_prefetch = max(1, int(tokenizer_prefetch))
 
     filter_cfg = FilterConfig.from_dict(data_prep_cfg)
 
@@ -934,6 +1249,17 @@ Examples:
         dtype = np.uint16 if vocab_size < 65536 else np.uint32
         print(f"Vocab size: {vocab_size}, dtype: {dtype}")
 
+        existing_train_tokens = 0
+        existing_val_tokens = 0
+        if args.resume:
+            existing_train_tokens = count_tokens_in_file(train_path, dtype, cap_at=train_tokens)
+            existing_val_tokens = count_tokens_in_file(val_path, dtype, cap_at=val_tokens)
+            print(
+                f"[resume] Existing files: train={existing_train_tokens:,}/{train_tokens:,} "
+                f"val={existing_val_tokens:,}/{val_tokens:,}",
+                flush=True,
+            )
+
         # Print configuration
         print(f"\nData preparation configuration:")
         print(f"  C4 weight: {c4_weight}")
@@ -944,6 +1270,8 @@ Examples:
         print(f"  Shuffle buffer: {shuffle_buffer:,}")
         print(f"  Seed: {seed}")
         print(f"  Dedup enabled: {filter_cfg.dedup_enabled}")
+        print(f"  Tokenizer workers: {tokenizer_workers}")
+        print(f"  Tokenizer prefetch: {tokenizer_prefetch}")
         print()
 
         # Initialize deduplicator
@@ -964,7 +1292,8 @@ Examples:
 
         # Set up interrupt handler
         with GracefulInterrupt() as interrupt_handler:
-            
+            overall_start = time.time()
+
             # =====================================================================
             # Process training data
             # =====================================================================
@@ -973,43 +1302,57 @@ Examples:
             print("=" * 60)
 
             train_start = time.time()
+            train_resume_tokens = existing_train_tokens if args.resume else 0
+            if train_resume_tokens >= train_tokens:
+                print(
+                    f"[resume] Training data already complete "
+                    f"({train_resume_tokens:,}/{train_tokens:,} tokens). Skipping.",
+                    flush=True,
+                )
+                actual_train_tokens = train_tokens
+                was_interrupted = False
+            else:
+                c4_iter = stream_c4(seed)
+                wiki_iter = stream_wikipedia(seed)
+                fineweb_iter = stream_fineweb(seed) if fineweb_weight > 0 else iter(())
 
-            c4_iter = stream_c4(seed)
-            wiki_iter = stream_wikipedia(seed)
-            fineweb_iter = stream_fineweb(seed) if fineweb_weight > 0 else iter(())
+                source_iter = interleave_sources(
+                    c4_iter,
+                    wiki_iter,
+                    fineweb_iter,
+                    c4_weight,
+                    wiki_weight,
+                    fineweb_weight,
+                    seed,
+                )
 
-            source_iter = interleave_sources(
-                c4_iter,
-                wiki_iter,
-                fineweb_iter,
-                c4_weight,
-                wiki_weight,
-                fineweb_weight,
-                seed,
-            )
+                tokens_iter = process_and_tokenize(
+                    source_iter,
+                    filter_cfg,
+                    sp,
+                    deduplicator,
+                    stats,
+                    shuffle_buffer,
+                    seed,
+                    tokenizer_workers=tokenizer_workers,
+                    tokenizer_prefetch=tokenizer_prefetch,
+                    tokenizer_model_path=tokenizer_model,
+                )
 
-            tokens_iter = process_and_tokenize(
-                source_iter,
-                filter_cfg,
-                sp,
-                deduplicator,
-                stats,
-                shuffle_buffer,
-                seed,
-            )
-
-            actual_train_tokens, was_interrupted = write_tokens_to_memmap(
-                tokens_iter,
-                train_path,
-                train_tokens,
-                dtype,
-                eos_token_id,
-                checkpoint_path,
-                args.checkpoint_interval,
-                log_interval,
-                stats,
-                interrupt_handler,
-            )
+                actual_train_tokens, was_interrupted = write_tokens_to_memmap(
+                    tokens_iter,
+                    train_path,
+                    train_tokens,
+                    dtype,
+                    eos_token_id,
+                    checkpoint_path,
+                    args.checkpoint_interval,
+                    log_interval,
+                    stats,
+                    interrupt_handler,
+                    phase="train",
+                    resume_existing_tokens=train_resume_tokens,
+                )
 
             train_elapsed = time.time() - train_start
             print(f"\nTraining data complete: {actual_train_tokens:,} tokens in {train_elapsed/60:.1f} minutes")
@@ -1037,6 +1380,7 @@ Examples:
             print("=" * 60)
 
             val_start = time.time()
+            val_resume_tokens = existing_val_tokens if args.resume else 0
 
             val_stats = {
                 "c4": FilterStats(),
@@ -1044,54 +1388,70 @@ Examples:
                 "fineweb": FilterStats(),
                 "dedup_rejects": 0,
             }
+            if val_resume_tokens >= val_tokens:
+                print(
+                    f"[resume] Validation data already complete "
+                    f"({val_resume_tokens:,}/{val_tokens:,} tokens). Skipping.",
+                    flush=True,
+                )
+                actual_val_tokens = val_tokens
+                was_interrupted = False
+            else:
+                val_seed = seed + 999
+                c4_iter = stream_c4(val_seed)
+                wiki_iter = stream_wikipedia(val_seed)
+                fineweb_iter = stream_fineweb(val_seed) if fineweb_weight > 0 else iter(())
 
-            val_seed = seed + 999
-            c4_iter = stream_c4(val_seed)
-            wiki_iter = stream_wikipedia(val_seed)
-            fineweb_iter = stream_fineweb(val_seed) if fineweb_weight > 0 else iter(())
-
-            source_iter = interleave_sources(
-                c4_iter,
-                wiki_iter,
-                fineweb_iter,
-                c4_weight,
-                wiki_weight,
-                fineweb_weight,
-                val_seed,
-            )
-
-            val_deduplicator = None
-            if filter_cfg.dedup_enabled:
-                val_deduplicator = MinHashDeduplicator(
-                    num_perm=filter_cfg.dedup_num_perm,
-                    threshold=filter_cfg.dedup_threshold,
+                source_iter = interleave_sources(
+                    c4_iter,
+                    wiki_iter,
+                    fineweb_iter,
+                    c4_weight,
+                    wiki_weight,
+                    fineweb_weight,
+                    val_seed,
                 )
 
-            tokens_iter = process_and_tokenize(
-                source_iter,
-                filter_cfg,
-                sp,
-                val_deduplicator,
-                val_stats,
-                shuffle_buffer // 10,
-                val_seed,
-            )
+                val_deduplicator = None
+                if filter_cfg.dedup_enabled:
+                    val_deduplicator = MinHashDeduplicator(
+                        num_perm=filter_cfg.dedup_num_perm,
+                        threshold=filter_cfg.dedup_threshold,
+                    )
 
-            actual_val_tokens, was_interrupted = write_tokens_to_memmap(
-                tokens_iter,
-                val_path,
-                val_tokens,
-                dtype,
-                eos_token_id,
-                checkpoint_path,
-                args.checkpoint_interval,
-                log_interval,
-                val_stats,
-                interrupt_handler,
-            )
+                tokens_iter = process_and_tokenize(
+                    source_iter,
+                    filter_cfg,
+                    sp,
+                    val_deduplicator,
+                    val_stats,
+                    shuffle_buffer // 10,
+                    val_seed,
+                    tokenizer_workers=tokenizer_workers,
+                    tokenizer_prefetch=tokenizer_prefetch,
+                    tokenizer_model_path=tokenizer_model,
+                )
+
+                actual_val_tokens, was_interrupted = write_tokens_to_memmap(
+                    tokens_iter,
+                    val_path,
+                    val_tokens,
+                    dtype,
+                    eos_token_id,
+                    checkpoint_path,
+                    args.checkpoint_interval,
+                    log_interval,
+                    val_stats,
+                    interrupt_handler,
+                    phase="val",
+                    resume_existing_tokens=val_resume_tokens,
+                )
 
             val_elapsed = time.time() - val_start
             print(f"\nValidation data complete: {actual_val_tokens:,} tokens in {val_elapsed/60:.1f} minutes")
+            if was_interrupted:
+                print("\n[!] Validation interrupted. Checkpoint saved. Use --resume to continue.")
+                return
 
         # =====================================================================
         # Save metadata
@@ -1108,6 +1468,8 @@ Examples:
             # Backward-compatible alias.
             "gutenberg_weight": fineweb_weight,
             "seed": seed,
+            "tokenizer_workers": tokenizer_workers,
+            "tokenizer_prefetch": tokenizer_prefetch,
             "tokenizer_model": os.path.abspath(tokenizer_model),
             "tokenizer_sha256": tokenizer_sha256,
             "tokenizer_vocab_size": vocab_size,
@@ -1147,7 +1509,7 @@ Examples:
         if os.path.exists(checkpoint_path):
             os.remove(checkpoint_path)
 
-        total_elapsed = time.time() - train_start
+        total_elapsed = time.time() - overall_start
         print(f"\nTotal time: {total_elapsed/60:.1f} minutes")
         print(f"Output files:")
         print(f"  {train_path} ({actual_train_tokens:,} tokens)")

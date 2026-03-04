@@ -30,6 +30,8 @@ data_prep:
   shuffle_buffer: 1000
   seed: 1337
   log_interval: 30
+  tokenizer_workers: 4
+  tokenizer_prefetch: 256
   
   # Global filter parameters (G0-G5)
   min_chars: 300

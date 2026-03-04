@@ -49,6 +49,8 @@ COMMANDS = [
             ("--shuffle_buffer", "50_000", "Streaming shuffle buffer size"),
             ("--seed", "1337", "Random seed"),
             ("--log_interval", "30", "Seconds between progress logs"),
+            ("--tokenizer_workers", "4", "Tokenization worker threads (<=0 means auto)"),
+            ("--tokenizer_prefetch", "256", "Max queued tokenization tasks"),
             ("--overwrite", "False", "Overwrite existing .bin files"),
         ],
     },
