@@ -1,6 +1,6 @@
 data:
-  train_bin: data/v2/train.bin
-  val_bin: data/v2/val.bin
+  train_bin: data/v3/train.bin
+  val_bin: data/v3/val.bin
   block_size: 2048
   dtype: uint16
   vocab_size: 32000
@@ -16,7 +16,7 @@ data:
 
 data_prep:
   tokenizer_model: tokenizer/spm.model
-  out_dir: data/v2
+  out_dir: data/v3
   train_tokens: 2000000000
   val_tokens: 20000000
   
@@ -66,7 +66,7 @@ data_prep:
   min_chunk_chars: 500
 
 eval:
-  checkpoint: runs/llama-100m-v2/final
+  checkpoint: runs/llama-100m-v3/final
   tokenizer_model: tokenizer/spm.model
   batches: 200
   prompt: "The quick brown fox"
@@ -78,7 +78,7 @@ eval:
   repetition_penalty: 1.1
 
 inference:
-  checkpoint: runs/llama-100m-v2/final
+  checkpoint: runs/llama-100m-v3/final
   model_config: configs/model_100m.yaml
   tokenizer: tokenizer/spm.model
   max_tokens: 100
@@ -105,11 +105,11 @@ training:
   weight_decay: 0.1
   betas: [0.9, 0.95]
   warmup_steps: 400
-  max_steps: 7630
+  max_steps: 15260
   eval_interval: 200
   log_interval: 50
-  save_interval: 1000  # align with upload cadence to avoid extra local checkpoints
-  output_dir: runs/llama-100m-v2
+  save_interval: 500
+  output_dir: runs/llama-100m-v3
   precision: bf16
   max_grad_norm: 1.0
   gradient_checkpointing: true
@@ -122,7 +122,7 @@ checkpoint_slots:
 
 checkpoint_upload:
   enabled: true  # Requires HF_TOKEN or huggingface-cli login
-  repo_id: ark296/llama-100m-v2-checkpoints
+  repo_id: ark296/llama-100m-v3-checkpoints
   upload_interval: 1000  # Upload every N steps (ignored in ephemeral mode; every save uploads)
   upload_optimizer: true  # Kept for compatibility; exact-resume mode uploads full checkpoint folders
   local_checkpoint_mode: ephemeral  # persistent|ephemeral (ephemeral keeps local checkpoints only until upload succeeds)
@@ -133,8 +133,8 @@ checkpoint_upload:
   resume_from_hf: null  # Optional: latest|best|final|step_XXXXXXX
   retention:
     enabled: true
-    keep_latest: 1
-    keep_best: 2
+    keep_latest: 2
+    keep_best: 3
 
 logging:
   enabled: true
