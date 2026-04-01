@@ -33,4 +33,5 @@ benchmark = "scripts.benchmark_throughput:main"
 tokenizer-repl = "scripts.tokenizer_repl:main"
 scan-bins = "scripts.scan_bins:main"
 infer = "scripts.infer:main"
+quick-lm-eval = "scripts.quick_lm_eval:main"
 
