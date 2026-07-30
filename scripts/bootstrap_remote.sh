@@ -91,18 +91,35 @@ uv run --with pytest pytest tests/ -q || die "Gate 0 tests failed; refusing to c
 
 log "VERIFIED: repo, environment, fingerprints, and Gate 0 are green."
 
-# --- 7. Optional launch under tmux with logging.
+# --- 7. Optional launch with logging.
+# The command is materialized into a script so quoting, env, and PATH survive
+# any launcher; the whole chain is redirected (not just its last pipeline
+# stage) so a failure in the first command still reaches the log. Both
+# lessons are from the first real run, where an inline tmux command string
+# died before logging anything.
 if [[ -n "${RUN_CMD:-}" ]]; then
   STAMP=$(date -u +%Y%m%dT%H%M%SZ)
   LOGFILE="$WORKDIR/runs/bootstrap_${STAMP}.log"
+  RUNFILE="$WORKDIR/runs/bootstrap_${STAMP}.sh"
   mkdir -p "$WORKDIR/runs"
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'export PATH="%s"\n' "$PATH"
+    printf 'cd %q || exit 1\n' "$WORKDIR"
+    printf '{ %s ; } >> %q 2>&1\n' "$RUN_CMD" "$LOGFILE"
+    printf 'rc=$?\n'
+    printf 'echo "[bootstrap] RUN_CMD exited rc=$rc $(date -u +%%FT%%TZ)" >> %q\n' "$LOGFILE"
+    if [[ -n "${SHUTDOWN_ON_EXIT:-}" ]]; then
+      printf 'sudo shutdown -h now\n'
+    fi
+  } > "$RUNFILE"
+  chmod +x "$RUNFILE"
   if command -v tmux >/dev/null 2>&1; then
-    log "launching in tmux session 'run': $RUN_CMD"
-    tmux new-session -d -s run "cd '$WORKDIR' && $RUN_CMD 2>&1 | tee '$LOGFILE'"
-    log "attach with: tmux attach -t run ; log: $LOGFILE"
+    log "launching in tmux session 'run'; log: $LOGFILE"
+    tmux new-session -d -s run "bash '$RUNFILE'"
   else
-    log "tmux missing; running in foreground"
-    bash -c "cd '$WORKDIR' && $RUN_CMD 2>&1 | tee '$LOGFILE'"
+    log "tmux missing; launching with nohup; log: $LOGFILE"
+    nohup bash "$RUNFILE" >/dev/null 2>&1 &
   fi
 else
   log "no RUN_CMD given; box is verified and idle. Auto-shutdown remains armed."
