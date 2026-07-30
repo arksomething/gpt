@@ -59,6 +59,7 @@ Run project commands through `uv`:
 | `uv run train --initialize_from <path>` | Start a new run from validated base weights |
 | `uv run eval` | Evaluate a checkpoint |
 | `uv run prepare-data` | Prepare tokenized training data |
+| `uv run check-sources` | Smoke-stream each Gate 1 mixture source from the hub |
 | `uv run train-tokenizer` | Train a SentencePiece tokenizer |
 | `uv run benchmark` | Measure training throughput |
 | `uv run infer` | Run model inference |

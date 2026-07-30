@@ -38,7 +38,8 @@ from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-from typing import Callable, Iterator, List, Optional
+from pathlib import Path
+from typing import Callable, Dict, Iterator, List, Optional
 
 import numpy as np
 import sentencepiece as spm
@@ -53,6 +54,7 @@ from scripts.filters import (
     apply_global_filters,
     apply_wiki_filters,
     chunk_text,
+    filter_by_length,
 )
 from scripts.canonical_writing import iter_canonical_manifest
 from scripts.indexed_shards import (
@@ -492,6 +494,244 @@ def stream_wikipedia(seed: int = 42) -> Iterator[str]:
 
 
 # =============================================================================
+# Gate 1 Mixture Sources
+# =============================================================================
+
+# Filter treatments applied to the bakeoff sources.
+#   "global"       - the same global filter stack FineWeb gets.
+#   "conversation" - global filters with a lower length floor: forum posts,
+#                    IRC logs, transcripts and commit messages are legitimately
+#                    short, so the 300-char floor would delete the source.
+#   "code"         - length only (plus the pipeline-wide dedup). Alpha-ratio,
+#                    weird-symbol, line-structure and boilerplate filters are
+#                    prose heuristics that reject essentially all source code.
+GLOBAL_TREATMENT = "global"
+CONVERSATION_TREATMENT = "conversation"
+CODE_TREATMENT = "code"
+
+# Length floor for conversation-style sources.
+CONVERSATION_MIN_CHARS = 200
+
+DEFAULT_LICENSE_NOTE = "Record-level rights may vary; review upstream terms."
+COMMON_PILE_LICENSE_NOTE = (
+    "Common Pile openly licensed subset; per-record licenses vary, review upstream terms."
+)
+
+
+@dataclass(frozen=True)
+class SourceSpec:
+    """A streaming source added for the Gate 1 mixture bakeoff."""
+
+    source_id: str
+    name: str
+    repo_id: str
+    config: Optional[str] = None
+    split: str = "train"
+    text_field: str = "text"
+    filter_treatment: str = GLOBAL_TREATMENT
+    license_note: str = DEFAULT_LICENSE_NOTE
+
+    @property
+    def is_common_pile(self) -> bool:
+        return self.repo_id.startswith("common-pile/")
+
+
+def _common_pile(
+    source_id: str,
+    name: str,
+    repo_id: str,
+    filter_treatment: str = GLOBAL_TREATMENT,
+) -> SourceSpec:
+    """Register a Common Pile dataset: one shared schema, one factory."""
+    return SourceSpec(
+        source_id=source_id,
+        name=name,
+        repo_id=repo_id,
+        config=None,
+        split="train",
+        text_field="text",
+        filter_treatment=filter_treatment,
+        license_note=COMMON_PILE_LICENSE_NOTE,
+    )
+
+
+# Order is display order only; sampling is weight-driven and name-sorted.
+MIXTURE_SOURCE_SPECS: tuple[SourceSpec, ...] = (
+    SourceSpec(
+        source_id="dclm",
+        name="DCLM-baseline 1.0",
+        repo_id="mlfoundations/dclm-baseline-1.0",
+    ),
+    SourceSpec(
+        source_id="finepdfs",
+        name="FinePDFs (English)",
+        repo_id="HuggingFaceFW/finepdfs",
+        config="eng_Latn",
+    ),
+    _common_pile(
+        "stackexchange",
+        "Common Pile StackExchange (filtered)",
+        "common-pile/stackexchange_filtered",
+        CONVERSATION_TREATMENT,
+    ),
+    _common_pile(
+        "youtube",
+        "Common Pile YouTube transcripts (filtered)",
+        "common-pile/youtube_filtered",
+        CONVERSATION_TREATMENT,
+    ),
+    _common_pile(
+        "ubuntu_irc",
+        "Common Pile Ubuntu IRC logs (filtered)",
+        "common-pile/ubuntu_irc_filtered",
+        CONVERSATION_TREATMENT,
+    ),
+    _common_pile(
+        "github_archive",
+        "Common Pile GitHub Archive (filtered)",
+        "common-pile/github_archive_filtered",
+        CONVERSATION_TREATMENT,
+    ),
+    _common_pile(
+        "uk_hansard",
+        "Common Pile UK Hansard (filtered)",
+        "common-pile/uk_hansard_filtered",
+        CONVERSATION_TREATMENT,
+    ),
+    SourceSpec(
+        source_id="finemath",
+        name="FineMath 4+",
+        repo_id="HuggingFaceTB/finemath",
+        config="finemath-4plus",
+    ),
+    _common_pile(
+        "code",
+        "Common Pile Stack v2 educational code (filtered)",
+        "common-pile/stackv2_edu_filtered",
+        CODE_TREATMENT,
+    ),
+    SourceSpec(
+        source_id="cosmopedia",
+        name="Cosmopedia v2 (SmolLM corpus)",
+        repo_id="HuggingFaceTB/smollm-corpus",
+        config="cosmopedia-v2",
+    ),
+    _common_pile(
+        "wikiteam",
+        "Common Pile WikiTeam wikis (filtered)",
+        "common-pile/wikiteam_filtered",
+    ),
+    _common_pile(
+        "libretexts",
+        "Common Pile LibreTexts (filtered)",
+        "common-pile/libretexts_filtered",
+    ),
+    _common_pile(
+        "narrative",
+        "Common Pile pre-1929 books (filtered)",
+        "common-pile/pre_1929_books_filtered",
+    ),
+)
+
+MIXTURE_SOURCES_BY_ID: Dict[str, SourceSpec] = {
+    spec.source_id: spec for spec in MIXTURE_SOURCE_SPECS
+}
+MIXTURE_SOURCE_IDS: tuple[str, ...] = tuple(
+    spec.source_id for spec in MIXTURE_SOURCE_SPECS
+)
+
+
+def stream_hf_text(
+    label: str,
+    repo_id: str,
+    seed: int = 42,
+    *,
+    config: Optional[str] = None,
+    split: str = "train",
+    text_field: str = "text",
+) -> Iterator[str]:
+    """Stream a plain-text field from any streaming-capable HF dataset."""
+
+    def dataset_factory():
+        print(
+            f"[{label}] Loading dataset repo={repo_id} config={config} split={split}...",
+            flush=True,
+        )
+        if config:
+            ds = load_dataset(repo_id, config, split=split, streaming=True)
+        else:
+            ds = load_dataset(repo_id, split=split, streaming=True)
+        print(f"[{label}] Starting iteration (no shuffle)...", flush=True)
+        return ds
+
+    def extract_text(example: dict) -> Optional[str]:
+        text = example.get(text_field) if isinstance(example, dict) else None
+        if isinstance(text, str) and text.strip():
+            return text
+        return None
+
+    _ = seed
+    yield from _stream_with_retries(label, dataset_factory, extract_text)
+
+
+def stream_common_pile(repo_id: str, seed: int = 42) -> Iterator[str]:
+    """Stream any Common Pile dataset.
+
+    Every Common Pile release shares one schema (a "text" field, single train
+    split), so all of them are instances of this factory rather than
+    copy-pasted per-source readers.
+    """
+    label = repo_id.split("/")[-1]
+    if label.endswith("_filtered"):
+        label = label[: -len("_filtered")]
+    yield from stream_hf_text(
+        label,
+        repo_id,
+        seed,
+        config=None,
+        split="train",
+        text_field="text",
+    )
+
+
+def open_mixture_stream(spec: SourceSpec, seed: int = 42) -> Iterator[str]:
+    """Open the streaming iterator for a registered mixture source."""
+    if spec.is_common_pile:
+        return stream_common_pile(spec.repo_id, seed)
+    return stream_hf_text(
+        spec.source_id,
+        spec.repo_id,
+        seed,
+        config=spec.config,
+        split=spec.split,
+        text_field=spec.text_field,
+    )
+
+
+def resolve_mixture_weights(args, data_prep_cfg: dict) -> Dict[str, float]:
+    """Resolve every mixture weight from CLI, then config, then 0.0."""
+    weights: Dict[str, float] = {}
+    for source_id in MIXTURE_SOURCE_IDS:
+        override = getattr(args, f"{source_id}_weight", None)
+        value = (
+            override
+            if override is not None
+            else data_prep_cfg.get(f"{source_id}_weight", 0.0)
+        )
+        weights[source_id] = float(value or 0.0)
+    return weights
+
+
+def active_mixture_weights(weights: Optional[Dict[str, float]]) -> Dict[str, float]:
+    """Only the mixture sources that are actually enabled."""
+    return {
+        source_id: float(weight)
+        for source_id, weight in sorted((weights or {}).items())
+        if float(weight) > 0
+    }
+
+
+# =============================================================================
 # Filtering
 # =============================================================================
 
@@ -589,6 +829,55 @@ def filter_and_transform_fineweb(
         return []
 
     chunks = chunk_text(text, filter_cfg.max_chunk_chars, filter_cfg.min_chunk_chars)
+    if chunks:
+        stats.record_pass()
+    else:
+        stats.record_reject("chunk_too_small")
+    return chunks
+
+
+def filter_and_transform_mixture(
+    text: str,
+    spec: SourceSpec,
+    filter_cfg: FilterConfig,
+    stats: FilterStats,
+) -> List[str]:
+    """Apply the registered filter treatment for a Gate 1 mixture source."""
+    if spec.filter_treatment == CODE_TREATMENT:
+        # Length + dedup only. Every other global filter is a prose heuristic
+        # (alpha ratio, weird symbols, line structure) that rejects code.
+        min_chars = filter_cfg.min_chars
+        if not filter_by_length(text, min_chars, filter_cfg.max_chars):
+            stats.record_reject(f"{spec.source_id}_G0_length")
+            return []
+    else:
+        min_chars = (
+            CONVERSATION_MIN_CHARS
+            if spec.filter_treatment == CONVERSATION_TREATMENT
+            else filter_cfg.min_chars
+        )
+        passed, reason = apply_global_filters(
+            text,
+            min_chars=min_chars,
+            max_chars=filter_cfg.max_chars,
+            min_alpha_ratio=filter_cfg.min_alpha_ratio,
+            max_repeat=filter_cfg.max_repeated_chars,
+            max_weird_ratio=filter_cfg.max_weird_ratio,
+            max_short_line_ratio=filter_cfg.max_short_line_ratio,
+            max_caps_ratio=filter_cfg.max_caps_ratio,
+        )
+        if not passed:
+            stats.record_reject(f"{spec.source_id}_{reason}")
+            return []
+
+    # A relaxed length floor is meaningless if chunking then drops everything
+    # under min_chunk_chars, so lower the chunk floor to match. Sources on the
+    # plain global treatment keep the FineWeb chunking behaviour exactly.
+    min_chunk_chars = filter_cfg.min_chunk_chars
+    if spec.filter_treatment != GLOBAL_TREATMENT:
+        min_chunk_chars = min(min_chunk_chars, min_chars)
+
+    chunks = chunk_text(text, filter_cfg.max_chunk_chars, min_chunk_chars)
     if chunks:
         stats.record_pass()
     else:
@@ -1404,6 +1693,14 @@ def process_and_tokenize(
                 chunks = filter_and_transform_wiki(text, filter_cfg, stats["wiki"])
             elif source_name == "fineweb":
                 chunks = filter_and_transform_fineweb(text, filter_cfg, stats["fineweb"])
+            elif source_name in MIXTURE_SOURCES_BY_ID:
+                source_stats = stats.setdefault(source_name, FilterStats())
+                chunks = filter_and_transform_mixture(
+                    text,
+                    MIXTURE_SOURCES_BY_ID[source_name],
+                    filter_cfg,
+                    source_stats,
+                )
             else:
                 source_stats = stats.setdefault(source_name, FilterStats())
                 chunks = filter_and_transform_generic(
@@ -1503,6 +1800,7 @@ def preparation_recipe_sha256(
     validation_fraction: float,
     canonical_manifest_sha256: str | None = None,
     writing_weight: float = 0.0,
+    mixture_weights: Optional[Dict[str, float]] = None,
 ) -> str:
     """Fingerprint deterministic preparation inputs shared by both splits."""
     payload = {
@@ -1521,6 +1819,11 @@ def preparation_recipe_sha256(
         "writing_weight": float(writing_weight),
         "filter_config": asdict(filter_cfg),
     }
+    # Only enabled mixture sources enter the fingerprint, so a legacy-weights
+    # run keeps the exact recipe hash it had before these sources existed.
+    active = active_mixture_weights(mixture_weights)
+    if active:
+        payload["mixture_source_weights"] = active
     encoded = json.dumps(
         payload,
         sort_keys=True,
@@ -1534,6 +1837,7 @@ def indexed_source_records(
     c4_weight: float,
     wiki_weight: float,
     fineweb_weight: float,
+    mixture_weights: Optional[Dict[str, float]] = None,
 ) -> List[Source]:
     """Describe enabled upstream sources without overstating text licensing."""
     candidates = (
@@ -1577,7 +1881,23 @@ def indexed_source_records(
             ),
         ),
     )
-    return [source for weight, source in candidates if weight > 0]
+    records = [source for weight, source in candidates if weight > 0]
+    for source_id in active_mixture_weights(mixture_weights):
+        spec = MIXTURE_SOURCES_BY_ID[source_id]
+        records.append(
+            Source(
+                spec.source_id,
+                spec.name,
+                metadata={
+                    "dataset": spec.repo_id,
+                    "config": spec.config,
+                    "split": spec.split,
+                    "filter_treatment": spec.filter_treatment,
+                    "license_note": spec.license_note,
+                },
+            )
+        )
+    return records
 
 
 def canonical_source_records(manifest_path: str | None) -> List[Source]:
@@ -1661,6 +1981,17 @@ Examples:
         default=None,
         help="Deprecated alias for --fineweb_weight.",
     )
+    for spec in MIXTURE_SOURCE_SPECS:
+        parser.add_argument(
+            f"--{spec.source_id}_weight",
+            type=float,
+            default=None,
+            help=(
+                f"Sampling weight for {spec.name} ({spec.repo_id}"
+                + (f":{spec.config}" if spec.config else "")
+                + "). Default 0.0 (source never initialized)."
+            ),
+        )
     parser.add_argument("--shuffle_buffer", type=int, default=None, help="Shuffle buffer size")
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
     parser.add_argument("--log_interval", type=int, default=None, help="Seconds between logs")
@@ -1753,11 +2084,15 @@ Examples:
             f"Canonical writing manifest not found: {canonical_manifest_path}"
         )
 
+    mixture_weights = resolve_mixture_weights(args, data_prep_cfg)
+    enabled_mixture_weights = active_mixture_weights(mixture_weights)
+
     if (
         c4_weight <= 0
         and wiki_weight <= 0
         and fineweb_weight <= 0
         and writing_weight <= 0
+        and not enabled_mixture_weights
     ):
         raise SystemExit("At least one source sampling weight must be > 0.")
     shuffle_buffer = args.shuffle_buffer or data_prep_cfg.get("shuffle_buffer", 50000)
@@ -1871,11 +2206,13 @@ Examples:
                 else None
             ),
             writing_weight=writing_weight,
+            mixture_weights=mixture_weights,
         )
         source_records = indexed_source_records(
             c4_weight,
             wiki_weight,
             fineweb_weight,
+            mixture_weights,
         )
         source_records.extend(
             canonical_source_records(canonical_manifest_path)
@@ -1933,6 +2270,13 @@ Examples:
         print(f"  Wikipedia weight: {wiki_weight}")
         print(f"  FineWeb weight: {fineweb_weight}")
         print(f"  Canonical writing weight: {writing_weight}")
+        for source_id, weight in enabled_mixture_weights.items():
+            spec = MIXTURE_SOURCES_BY_ID[source_id]
+            config_suffix = f":{spec.config}" if spec.config else ""
+            print(
+                f"  {source_id} weight: {weight} "
+                f"({spec.repo_id}{config_suffix}, {spec.filter_treatment} filters)"
+            )
         if canonical_manifest_path:
             print(f"  Canonical manifest: {canonical_manifest_path}")
         print(f"  Output format: {output_format}")
@@ -1964,6 +2308,8 @@ Examples:
             "fineweb": FilterStats(),
             "dedup_rejects": 0,
         }
+        for source_id in enabled_mixture_weights:
+            stats.setdefault(source_id, FilterStats())
         for source in canonical_source_records(canonical_manifest_path):
             stats.setdefault(source.source_id, FilterStats())
 
@@ -1983,6 +2329,14 @@ Examples:
                     fineweb_weight,
                 ),
             }
+            # Zero-weight mixture sources are never constructed, so a disabled
+            # source never touches the network.
+            for source_id, weight in enabled_mixture_weights.items():
+                spec = MIXTURE_SOURCES_BY_ID[source_id]
+                lanes[source_id] = (
+                    wrap(source_id, open_mixture_stream(spec, split_seed)),
+                    weight,
+                )
             if canonical_manifest_path and writing_weight > 0:
                 lanes["canonical_writing"] = (
                     iter_canonical_manifest(
@@ -2114,6 +2468,8 @@ Examples:
                 "fineweb": FilterStats(),
                 "dedup_rejects": 0,
             }
+            for source_id in enabled_mixture_weights:
+                val_stats.setdefault(source_id, FilterStats())
             for source in canonical_source_records(canonical_manifest_path):
                 val_stats.setdefault(source.source_id, FilterStats())
             if val_final_exists or val_resume_tokens >= val_tokens:
@@ -2219,6 +2575,17 @@ Examples:
             "wiki_weight": wiki_weight,
             "fineweb_weight": fineweb_weight,
             "writing_weight": writing_weight,
+            "mixture_source_weights": enabled_mixture_weights,
+            "mixture_sources": {
+                source_id: {
+                    "dataset": MIXTURE_SOURCES_BY_ID[source_id].repo_id,
+                    "config": MIXTURE_SOURCES_BY_ID[source_id].config,
+                    "filter_treatment": MIXTURE_SOURCES_BY_ID[
+                        source_id
+                    ].filter_treatment,
+                }
+                for source_id in enabled_mixture_weights
+            },
             "canonical_manifest": (
                 os.path.abspath(canonical_manifest_path)
                 if canonical_manifest_path

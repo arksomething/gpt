@@ -48,7 +48,7 @@ def generate_reply(
     user_text: str,
     device: str,
     max_new_tokens: int = 120,
-    temperature: float = 0.7,
+    temperature: float = 0.45,
     top_p: float = 0.9,
     repetition_penalty: float = 1.3,
 ) -> str:

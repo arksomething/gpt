@@ -49,7 +49,30 @@ data_prep:
     weight: 0.00
   # Backward-compatible alias; ignored when fineweb_weight is set.
   gutenberg_weight: 0.00
-  
+
+  # Gate 1 mixture bakeoff sources. All default to 0.0: a zero-weight source is
+  # never constructed and never touches the network, and a run with only the
+  # legacy weights above is byte-identical (including its recipe sha256) to one
+  # prepared before these sources existed.
+  # Filter treatment per source is fixed in scripts/prepare_data.py:
+  #   conversation (min_chars 200): stackexchange, youtube, ubuntu_irc,
+  #                                 github_archive, uk_hansard
+  #   code (length + dedup only):   code
+  #   global (like fineweb):        everything else
+  dclm_weight: 0.00            # mlfoundations/dclm-baseline-1.0
+  finepdfs_weight: 0.00        # HuggingFaceFW/finepdfs:eng_Latn
+  stackexchange_weight: 0.00   # common-pile/stackexchange_filtered
+  youtube_weight: 0.00         # common-pile/youtube_filtered
+  ubuntu_irc_weight: 0.00      # common-pile/ubuntu_irc_filtered
+  github_archive_weight: 0.00  # common-pile/github_archive_filtered
+  uk_hansard_weight: 0.00      # common-pile/uk_hansard_filtered
+  finemath_weight: 0.00        # HuggingFaceTB/finemath:finemath-4plus
+  code_weight: 0.00            # common-pile/stackv2_edu_filtered
+  cosmopedia_weight: 0.00      # HuggingFaceTB/smollm-corpus:cosmopedia-v2
+  wikiteam_weight: 0.00        # common-pile/wikiteam_filtered
+  libretexts_weight: 0.00      # common-pile/libretexts_filtered
+  narrative_weight: 0.00       # common-pile/pre_1929_books_filtered
+
   shuffle_buffer: 1000
   seed: 1337
   log_interval: 30

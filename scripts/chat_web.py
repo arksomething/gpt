@@ -78,6 +78,7 @@ def main() -> None:
     parser.add_argument("--model_config", default="configs/model_25m.yaml")
     parser.add_argument("--tokenizer", default="tokenizer/spm.model")
     parser.add_argument("--port", type=int, default=7860)
+    parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
@@ -85,8 +86,8 @@ def main() -> None:
     Handler.model, _ = load_model(args.checkpoint, args.model_config, args.device)
     Handler.sp = spm.SentencePieceProcessor(model_file=args.tokenizer)
     Handler.device = args.device
-    print(f"chat UI: http://127.0.0.1:{args.port}")
-    ThreadingHTTPServer(("127.0.0.1", args.port), Handler).serve_forever()
+    print(f"chat UI: http://{args.host}:{args.port}")
+    ThreadingHTTPServer((args.host, args.port), Handler).serve_forever()
 
 
 if __name__ == "__main__":
