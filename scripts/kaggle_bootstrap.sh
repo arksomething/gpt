@@ -15,7 +15,7 @@
 set -euo pipefail
 REPO_URL="${REPO_URL:-https://github.com/arksomething/gpt.git}"
 REPO_BRANCH="${REPO_BRANCH:-main}"
-WORKDIR="${WORKDIR:-/kaggle/working/gpt}"
+WORKDIR="${WORKDIR:-/tmp/gpt}"  # NOT /kaggle/working: that dir persists as output and a venv there bloats the bundle to GBs
 SMOKE="${SMOKE:-1}"
 SMOKE_TOKENS="${SMOKE_TOKENS:-5000000}"
 
