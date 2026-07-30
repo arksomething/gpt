@@ -30,7 +30,7 @@ from transformers import (
     AutoTokenizer,
     LlamaConfig,
     LlamaForCausalLM,
-    LlamaTokenizerFast,
+    LlamaTokenizer,
 )
 
 PROBE_TEXTS = [
@@ -94,7 +94,12 @@ def main() -> None:
     args.out.mkdir(parents=True, exist_ok=True)
     source.save_pretrained(args.out, safe_serialization=True)
 
-    tokenizer = LlamaTokenizerFast(
+    # Slow (sentencepiece-backed) tokenizer: wraps spm.model directly, so its
+    # output is the training tokenizer's output by construction. The fast
+    # converter silently produced an empty vocab for this non-Llama spm and
+    # encoded every string to [BOS] — caught only because verification below
+    # now checks tokenizer parity, not just model logits.
+    tokenizer = LlamaTokenizer(
         vocab_file=str(args.tokenizer),
         unk_token="<unk>",
         bos_token="<s>",
@@ -102,23 +107,31 @@ def main() -> None:
         pad_token="<pad>",
         add_bos_token=True,
         add_eos_token=False,
-        legacy=False,
+        legacy=True,
     )
     tokenizer.save_pretrained(args.out)
 
     # --- verification through the third-party loading path
+    import sentencepiece as spm_lib
+
     reloaded = AutoModelForCausalLM.from_pretrained(args.out, torch_dtype=torch.float32)
     reloaded.eval()
-    re_tok = AutoTokenizer.from_pretrained(args.out)
+    re_tok = AutoTokenizer.from_pretrained(args.out, use_fast=False)
+    sp = spm_lib.SentencePieceProcessor(model_file=str(args.tokenizer))
 
     worst = 0.0
+    tokenizer_ok = True
     for text in PROBE_TEXTS:
-        ids = re_tok(text, return_tensors="pt").input_ids
+        hf_ids = re_tok.encode(text)
+        spm_ids = [re_tok.bos_token_id] + sp.encode(text)
+        if hf_ids != spm_ids:
+            tokenizer_ok = False
+        ids = torch.tensor([hf_ids])
         with torch.no_grad():
             a = source(ids).logits
             b = reloaded(ids).logits
         worst = max(worst, float((a - b).abs().max()))
-    passed = worst <= LOGIT_TOLERANCE
+    passed = worst <= LOGIT_TOLERANCE and tokenizer_ok
 
     report = {
         "source_checkpoint": str(args.checkpoint),
@@ -126,6 +139,7 @@ def main() -> None:
         "tokenizer_sha256": _sha256(args.tokenizer),
         "probe_texts": PROBE_TEXTS,
         "max_abs_logit_diff": worst,
+        "tokenizer_parity": tokenizer_ok,
         "tolerance": LOGIT_TOLERANCE,
         "passed": passed,
     }
