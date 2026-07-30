@@ -1,0 +1,46 @@
+# SFT rehearsal: 25M base (AWS probe 2026-07-30) on the Dolly-15k rehearsal
+# corpus. Purpose is to exercise the full post-training pipeline end-to-end
+# at negligible cost before the 350M run uses it for real.
+data:
+  block_size: 2048
+  dtype: uint16
+  vocab_size: 32000
+  train_bin: null
+  val_bin: null
+  hf_repo: null
+  indexed:
+    enabled: true
+    train_dir: data/chat/v1/train
+    val_dir: data/chat/v1/validation
+    tokenizer_sha256: d879422cadb5566190960da5fbe18b2163cb79df4bad192474c42bdb449a861f
+    recipe_sha256: null
+    verify_hashes: true
+    source_weights: null
+    validation_source_weights: null
+  streaming:
+    enabled: false
+
+data_prep:
+  tokenizer_model: tokenizer/spm.model
+
+training:
+  # Fresh optimizer over fingerprint-validated base weights.
+  initialize_from: runs/probes/25m-base/final
+  seed: 1337
+  micro_batch_size: 8
+  grad_accum_steps: 1
+  learning_rate: 5.0e-5
+  weight_decay: 0.0
+  betas: [0.9, 0.95]
+  warmup_steps: 10
+  max_steps: 120        # ~3 epochs over 618k chat tokens at 16,384 tok/step
+  eval_interval: 30
+  log_interval: 10
+  save_interval: 60
+  output_dir: runs/sft/25m-dolly-rehearsal
+  # fp16, not bf16: the rehearsal targets Kaggle T4s (Turing has no bf16).
+  precision: fp16
+  max_grad_norm: 1.0
+  gradient_checkpointing: false
+  allow_tf32: true
+  checkpoint_limit: 2
