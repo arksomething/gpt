@@ -23,6 +23,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BASE_CONFIG = os.path.join(REPO_ROOT, "configs", "train_25m_probe.yaml")
 OUT_DIR = os.path.join(REPO_ROOT, "configs", "gate1")
 UNION_CORPUS = "data/gate1/union-v1"
+G6_XLARGE_HOURLY = 0.81  # us-east-1 on-demand; spot runs cost less, never more
 
 # The conversation sub-corpus. OASST's planned 0.5 point is folded into
 # stackexchange: the chat lane (data/chat/v1, 0.6M tokens) is too small to
@@ -118,6 +119,13 @@ def build_config(name: str, arm: Dict[str, object], base: dict) -> dict:
     cfg["training"]["seed"] = arm["seed"]
     cfg["training"]["output_dir"] = f"runs/gate1/{name}"
     cfg["budget"]["throughput_path"] = f"runs/gate1/{name}/throughput.json"
+    # The template ships zeroes, which silently disables the budget guard
+    # entirely (train.py skips the check when any value is <= 0). A g6.xlarge
+    # at ~60k tok/s should finish 250M tokens for about $0.95, so a $5 ceiling
+    # leaves room for a slow box while still catching a throughput collapse
+    # before it runs to the 8h kill-switch.
+    cfg["budget"]["hourly_rate"] = G6_XLARGE_HOURLY
+    cfg["budget"]["max_cost"] = 5.0
     return cfg
 
 
