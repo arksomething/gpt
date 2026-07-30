@@ -28,25 +28,17 @@ cd "$WORKDIR"
 log "revision: $(git rev-parse --short HEAD)"
 uv sync --frozen || die "uv sync failed"
 
-# --- stage inputs from the attached dataset (handles zipped or extracted)
+# --- stage inputs by discovery: Kaggle mount paths vary by slug/version.
+log "input mounts:"; ls -la /kaggle/input/ || true
 mkdir -p runs/probes/25m-base/final data/chat
-if [[ -f "$DS/base/final/model.pt" ]]; then
-  cp "$DS/base/final/model.pt" runs/probes/25m-base/final/
-  cp "$DS/base/artifacts_manifest.json" runs/probes/25m-base/
-elif [[ -f "$DS/base.zip" ]]; then
-  unzip -q "$DS/base.zip" -d /tmp/base_ds
-  cp /tmp/base_ds/final/model.pt runs/probes/25m-base/final/
-  cp /tmp/base_ds/artifacts_manifest.json runs/probes/25m-base/
-else
-  die "base checkpoint not found in dataset at $DS"
-fi
-if [[ -d "$DS/chat/v1" ]]; then
-  cp -r "$DS/chat/v1" data/chat/
-elif [[ -f "$DS/chat.zip" ]]; then
-  unzip -q "$DS/chat.zip" -d data/chat/
-else
-  die "chat corpus not found in dataset at $DS"
-fi
+MODEL_PT=$(find /kaggle/input -name model.pt -path '*base*' 2>/dev/null | head -1)
+MANIFEST=$(find /kaggle/input -name artifacts_manifest.json 2>/dev/null | head -1)
+CHAT_MANIFEST=$(find /kaggle/input -name chat_manifest.json 2>/dev/null | head -1)
+[[ -n "$MODEL_PT" && -n "$MANIFEST" ]] || die "base checkpoint not found anywhere under /kaggle/input"
+[[ -n "$CHAT_MANIFEST" ]] || die "chat corpus not found anywhere under /kaggle/input"
+cp "$MODEL_PT" runs/probes/25m-base/final/
+cp "$MANIFEST" runs/probes/25m-base/
+cp -r "$(dirname "$CHAT_MANIFEST")" data/chat/v1
 [[ -d data/chat/v1/train ]] || die "chat corpus layout unexpected"
 
 # --- fingerprints + Gate 0
