@@ -48,10 +48,20 @@ log "running Gate 0 suite"
 uv run --with pytest pytest tests/ -q || die "Gate 0 failed"
 
 # --- SFT
-log "starting SFT (120 steps, assistant-masked, fp16 for T4)"
+# Kaggle may schedule a P100 (sm_60), which torch>=2.x no longer supports.
+# Detect and fall back to CPU with full precision; the run is small enough.
+TRAIN_CFG=configs/train_25m_chat_sft.yaml
+CAP=$(uv run python -c "import torch; print(torch.cuda.get_device_capability()[0] if torch.cuda.is_available() else 0)" 2>/dev/null || echo 0)
+if [[ "${CAP:-0}" -lt 7 ]]; then
+  log "GPU unusable (capability ${CAP}); falling back to CPU fp32"
+  export CUDA_VISIBLE_DEVICES=""
+  sed 's/precision: fp16/precision: "no"/' "$TRAIN_CFG" > /tmp/sft_cpu.yaml
+  TRAIN_CFG=/tmp/sft_cpu.yaml
+fi
+log "starting SFT (120 steps, assistant-masked) with $TRAIN_CFG"
 uv run python scripts/train.py \
   --model_config configs/model_25m.yaml \
-  --train_config configs/train_25m_chat_sft.yaml || die "SFT failed"
+  --train_config "$TRAIN_CFG" || die "SFT failed"
 
 # --- chat-formatted samples from the tuned model
 for q in "What is the capital of France?" "Explain what a computer does, simply." "Give me three tips for better sleep."; do
