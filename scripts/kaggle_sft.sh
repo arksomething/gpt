@@ -10,6 +10,12 @@ DS="${DS:-/kaggle/input/gpt-25m-base-and-chat-v1}"
 log() { printf '\n[kaggle-sft] %s\n' "$*"; }
 die() { printf '\n[kaggle-sft] FATAL: %s\n' "$*" >&2; exit 1; }
 
+# Mirror everything into the persisted output so a failed run is always
+# diagnosable from the small artifact bundle (notebook `!` swallows exit
+# codes and the API does not expose logs cleanly).
+mkdir -p /kaggle/working
+exec > >(tee -a /kaggle/working/sft_run.log) 2>&1
+
 log "start $(date -u +%FT%TZ)"
 command -v uv >/dev/null 2>&1 || { curl -LsSf https://astral.sh/uv/install.sh | sh; export PATH="$HOME/.local/bin:$PATH"; }
 
