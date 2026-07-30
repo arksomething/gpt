@@ -25,6 +25,21 @@ END_MARKER = "<|end|>"
 USER = "<|user|>"
 ASSISTANT = "<|assistant|>"
 
+import re
+
+# Marker or marker debris: "<|end|>", "|end|>", "<|end", "<|user|>", "<|" ...
+_MARKER_RE = re.compile(r"<\|[a-z]*\|?>?|\|(?:end|user|assistant)\|>?")
+
+
+def _clean_marker_prefix(text: str) -> str:
+    """Strip marker debris (and stray whitespace) from the start of a reply."""
+    while True:
+        stripped = text.lstrip()
+        m = _MARKER_RE.match(stripped)
+        if not m:
+            return stripped
+        text = stripped[m.end():]
+
 
 def generate_reply(
     model,
@@ -44,7 +59,6 @@ def generate_reply(
 
     ids = [sp.bos_id()] + sp.encode(prompt)
     input_ids = torch.tensor([ids], device=device)
-    end_ids = sp.encode(END_MARKER)
 
     generated: list[int] = []
     past = None
@@ -76,11 +90,16 @@ def generate_reply(
             generated.append(token)
             input_ids = torch.cat([input_ids, torch.tensor([[token]], device=device)], dim=1)
 
-            if len(generated) >= len(end_ids) and generated[-len(end_ids):] == end_ids:
-                generated = generated[: -len(end_ids)]
-                break
+            # String-level stop. Small models emit imperfect markers
+            # ("|end|>", "<|end", a bare "<|user|>" turn start), so match
+            # marker debris by pattern, drop any that prefixes the reply,
+            # and cut at the first one that appears mid-text.
+            text = _clean_marker_prefix(sp.decode(generated))
+            m = _MARKER_RE.search(text)
+            if m:
+                return text[: m.start()].strip()
 
-    return sp.decode(generated).strip()
+    return _clean_marker_prefix(sp.decode(generated)).strip()
 
 
 def main() -> None:
