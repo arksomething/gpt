@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import hashlib
 import json
 import os
 import time
@@ -13,6 +14,31 @@ from transformers import LlamaConfig, LlamaForCausalLM
 def load_yaml(path):
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
+
+
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def workload_fingerprint(model_config_sha256, data_cfg, optim_cfg):
+    payload = {
+        "model_config_sha256": model_config_sha256,
+        "block_size": int(data_cfg["block_size"]),
+        "micro_batch_size": int(optim_cfg["micro_batch_size"]),
+        "grad_accum_steps": int(optim_cfg["grad_accum_steps"]),
+        "precision": optim_cfg.get("precision", "bf16"),
+        "gradient_checkpointing": bool(
+            optim_cfg.get("gradient_checkpointing", False)
+        ),
+    }
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def main():
@@ -93,6 +119,12 @@ def main():
 
     tokens_per_sec = tokens_per_step * args.steps / max(1e-6, elapsed)
     result = {
+        "schema_version": 2,
+        "created_at_unix": time.time(),
+        "model_config_sha256": file_sha256(args.model_config),
+        "workload_sha256": workload_fingerprint(
+            file_sha256(args.model_config), data_cfg, optim_cfg
+        ),
         "tokens_per_sec": tokens_per_sec,
         "tokens_per_step": tokens_per_step,
         "micro_batch_size": micro_batch,
@@ -101,6 +133,16 @@ def main():
         "world_size": world_size,
         "elapsed_sec": elapsed,
         "steps": args.steps,
+        "precision": optim_cfg.get("precision", "bf16"),
+        "gradient_checkpointing": bool(
+            optim_cfg.get("gradient_checkpointing", False)
+        ),
+        "device": str(device),
+        "cuda_device_name": (
+            torch.cuda.get_device_name(device)
+            if device.type == "cuda"
+            else None
+        ),
     }
 
     os.makedirs(os.path.dirname(args.output_path), exist_ok=True)

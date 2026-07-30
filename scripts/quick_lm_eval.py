@@ -11,7 +11,7 @@ This script wraps the exact "quick check" recipe used in this repo:
 Examples:
     uv run quick-lm-eval --models local
     uv run quick-lm-eval --models local,gpt2,opt125m,smollm2
-    uv run quick-lm-eval --models local --local_pretrained runs/llama-100m-v4/hf-eval --local_tokenizer runs/llama-100m-v4/hf-eval
+    uv run quick-lm-eval --models local --local_pretrained runs/llama-100m-v3/hf-eval --local_tokenizer runs/llama-100m-v3/hf-eval
 """
 
 from __future__ import annotations

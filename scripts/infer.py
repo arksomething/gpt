@@ -256,7 +256,9 @@ def main():
     checkpoint_upload_cfg = full_cfg.get("checkpoint_upload", {})
 
     # Merge config with CLI args (CLI takes precedence)
-    checkpoint = args.checkpoint or inference_cfg.get("checkpoint", "runs/llama-100m/final")
+    checkpoint = args.checkpoint or inference_cfg.get(
+        "checkpoint", "runs/llama-100m-v3/final"
+    )
     model_config = args.model_config or inference_cfg.get("model_config", "configs/model_100m.yaml")
     tokenizer_path = args.tokenizer or inference_cfg.get("tokenizer", "tokenizer/spm.model")
     prompt = args.prompt or inference_cfg.get("prompt", "The quick brown fox")

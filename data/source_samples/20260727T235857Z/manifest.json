@@ -1,0 +1,360 @@
+{
+  "created_utc": "2026-07-27T23:58:57+00:00",
+  "docs_per_source": 12,
+  "max_chars": 60000,
+  "registry_path": "data/sources.yaml",
+  "registry_sha256": "5db3ac63b2a98123cf3518a6ab06965c59b02543bfc4446da8de593b4717a59d",
+  "run_id": "20260727T235857Z",
+  "schema_version": 1,
+  "seed": 20260727,
+  "sources": {
+    "common_pile_doab": {
+      "acquisition": {
+        "dataset_id": "common-pile/doab",
+        "revision": "89e7a35935045f2b268a2229347e38f16fbeb729",
+        "split": "train"
+      },
+      "acquisition_kind": "huggingface",
+      "character_count": 157004,
+      "document_count": 12,
+      "documents_path": "data/source_samples/20260727T235857Z/common_pile_doab/documents.jsonl",
+      "documents_sha256": "5e6077453bae96c921cf306825bcc1af2b6d7ec8b061d95201635df9346197e2",
+      "license": "per-document-open-license",
+      "name": "Common Pile DOAB open-access books",
+      "policy_snapshots": [
+        {
+          "content_type": "text/html; charset=utf-8",
+          "label": "license",
+          "path": "data/source_samples/20260727T235857Z/common_pile_doab/policy/license.html",
+          "sha256": "9caa27da26cf81ed1e86a1c684069dd38e0736ee8ec6fd8cce63fe6ccce82527",
+          "url": "https://huggingface.co/datasets/common-pile/doab"
+        }
+      ],
+      "redistribution": "redistributable",
+      "status": "complete",
+      "tier": "A"
+    },
+    "common_pile_gutenberg": {
+      "acquisition": {
+        "dataset_id": "common-pile/project_gutenberg",
+        "revision": "01dc90a5002f8977c7fb03a372c14bca29c65cf1",
+        "split": "train"
+      },
+      "acquisition_kind": "huggingface",
+      "character_count": 561278,
+      "document_count": 12,
+      "documents_path": "data/source_samples/20260727T235857Z/common_pile_gutenberg/documents.jsonl",
+      "documents_sha256": "5f1dcf71677bdd06a0bee3f41d7904a96e9fc87a485532e9b05ba83c12b41f11",
+      "license": "public-domain-filtered",
+      "name": "Common Pile Project Gutenberg",
+      "policy_snapshots": [
+        {
+          "content_type": "text/html; charset=utf-8",
+          "label": "license",
+          "path": "data/source_samples/20260727T235857Z/common_pile_gutenberg/policy/license.html",
+          "sha256": "b0c2ce93cfb62c9a177ca5cd17d98865ff8d8ece954d0604b7ddb17ff71a50f5",
+          "url": "https://huggingface.co/datasets/common-pile/project_gutenberg"
+        }
+      ],
+      "redistribution": "redistributable",
+      "status": "complete",
+      "tier": "A"
+    },
+    "common_pile_pes2o": {
+      "acquisition": {
+        "dataset_id": "common-pile/peS2o",
+        "revision": "2caeba1585aaafa3c965410d80af85b09ed11cd9",
+        "split": "train"
+      },
+      "acquisition_kind": "huggingface",
+      "character_count": 261818,
+      "document_count": 12,
+      "documents_path": "data/source_samples/20260727T235857Z/common_pile_pes2o/documents.jsonl",
+      "documents_sha256": "872f9d4c441506abfe98082e58384c3175ba838f9804490b7b3223b36e2e62fb",
+      "license": "per-document-open-license",
+      "name": "Common Pile open-license peS2o",
+      "policy_snapshots": [
+        {
+          "content_type": "text/html; charset=utf-8",
+          "label": "license",
+          "path": "data/source_samples/20260727T235857Z/common_pile_pes2o/policy/license.html",
+          "sha256": "47ee4387b5d84a1e0e356bfa5bb6d9d2a05f2989a7b228fdeca3c947c2da4996",
+          "url": "https://huggingface.co/datasets/common-pile/peS2o"
+        }
+      ],
+      "redistribution": "redistributable",
+      "status": "complete",
+      "tier": "A"
+    },
+    "common_pile_stackexchange": {
+      "acquisition": {
+        "dataset_id": "common-pile/stackexchange",
+        "revision": "5ec3aa2e65b7c61b7c18f1ff18ccbc4d3279a23c",
+        "split": "train"
+      },
+      "acquisition_kind": "huggingface",
+      "character_count": 23346,
+      "document_count": 12,
+      "documents_path": "data/source_samples/20260727T235857Z/common_pile_stackexchange/documents.jsonl",
+      "documents_sha256": "252a03f44f292276e352531b1a3c89d4814364d891960745408897292fbfaf87",
+      "license": "per-document-CC-BY-SA",
+      "name": "Common Pile Stack Exchange",
+      "policy_snapshots": [
+        {
+          "content_type": "text/html; charset=utf-8",
+          "label": "license",
+          "path": "data/source_samples/20260727T235857Z/common_pile_stackexchange/policy/license.html",
+          "sha256": "927da44fc36fe2c5e82538ce041deacc0e0a62580c5018b76319ba3ec34990ce",
+          "url": "https://huggingface.co/datasets/common-pile/stackexchange"
+        }
+      ],
+      "redistribution": "redistributable",
+      "status": "complete",
+      "tier": "A"
+    },
+    "common_pile_wikimedia": {
+      "acquisition": {
+        "dataset_id": "common-pile/wikimedia_filtered",
+        "revision": "0641bb84bd9b7162bcddf8be7836822161a9a342",
+        "split": "train"
+      },
+      "acquisition_kind": "huggingface",
+      "character_count": 44108,
+      "document_count": 12,
+      "documents_path": "data/source_samples/20260727T235857Z/common_pile_wikimedia/documents.jsonl",
+      "documents_sha256": "ca2f956bd8ad890f3d2d342fcb514f84e046ea3953947ee28c4b50c70c75197e",
+      "license": "per-document-wikimedia-license",
+      "name": "Common Pile filtered Wikimedia",
+      "policy_snapshots": [
+        {
+          "content_type": "text/html; charset=utf-8",
+          "label": "license",
+          "path": "data/source_samples/20260727T235857Z/common_pile_wikimedia/policy/license.html",
+          "sha256": "c3497257f37dfb841694d1f18c0d358aa1599ea4be75b7f7ba84e4b60f067f00",
+          "url": "https://huggingface.co/datasets/common-pile/wikimedia_filtered"
+        }
+      ],
+      "redistribution": "redistributable",
+      "status": "complete",
+      "tier": "A"
+    },
+    "crs_reports": {
+      "acquisition": {
+        "index_rows": 23357,
+        "index_sha256": "9b04589b675b061b53febbc485e6321126d310645dcfa21706c448054cc49026",
+        "index_url": "https://www.everycrsreport.com/reports.csv"
+      },
+      "acquisition_kind": "crs_csv",
+      "character_count": 241342,
+      "document_count": 12,
+      "documents_path": "data/source_samples/20260727T235857Z/crs_reports/documents.jsonl",
+      "documents_sha256": "fbb40c08c35647c8bcabbf5177536dee0cd7affcb0ba7bbc393bfbd321a08836",
+      "license": "US-Public-Domain",
+      "name": "Congressional Research Service reports",
+      "policy_snapshots": [
+        {
+          "content_type": "text/html",
+          "label": "license",
+          "path": "data/source_samples/20260727T235857Z/crs_reports/policy/license.html",
+          "sha256": "ab8ff7027a03d59d4f6dde06961cb8021797445de4c34122aa03f9671da882c2",
+          "url": "https://www.everycrsreport.com/download.html"
+        }
+      ],
+      "redistribution": "redistributable",
+      "status": "complete",
+      "tier": "A"
+    },
+    "gwern": {
+      "acquisition": {
+        "candidate_urls": 956,
+        "errors": [],
+        "sitemap_sha256": "0d7c81309e1d6d5ecaf70e0e7d0bc7679792092cc1f8dfc1aa0a630fcd26165e",
+        "sitemap_url": "https://gwern.net/sitemap.xml"
+      },
+      "acquisition_kind": "sitemap_html",
+      "character_count": 249060,
+      "document_count": 12,
+      "documents_path": "data/source_samples/20260727T235857Z/gwern/documents.jsonl",
+      "documents_sha256": "93d07bd5adbe0731297d0edfcb8a64952075bae64b5923edcd6818ccb4e56329",
+      "license": "CC0-1.0",
+      "name": "Gwern.net essays",
+      "policy_snapshots": [
+        {
+          "error": "HTTPError: HTTP Error 301: The HTTP server returned a redirect error that would lead to an infinite loop.\nThe last 30x error message was:\nMoved Permanently",
+          "label": "robots_url",
+          "url": "https://gwern.net/robots.txt"
+        },
+        {
+          "content_type": "text/html; charset=utf-8",
+          "label": "license",
+          "path": "data/source_samples/20260727T235857Z/gwern/policy/license.html",
+          "sha256": "67ffee4104710c98ac06b0e63d1c6ba9cbb7845127ee13e08bce8b95a6bbece9",
+          "url": "https://gwern.net/about#license"
+        }
+      ],
+      "redistribution": "redistributable",
+      "status": "complete",
+      "tier": "A"
+    },
+    "our_world_in_data": {
+      "acquisition": {
+        "candidate_urls": 1990,
+        "errors": [],
+        "sitemap_sha256": "cc1c471fd42f9efd727da9a62e448e0b33e79cded5d00d9ea72c746891485eb5",
+        "sitemap_url": "https://ourworldindata.org/sitemap.xml"
+      },
+      "acquisition_kind": "sitemap_html",
+      "character_count": 144471,
+      "document_count": 12,
+      "documents_path": "data/source_samples/20260727T235857Z/our_world_in_data/documents.jsonl",
+      "documents_sha256": "8425784adedd325571f3ffba33bd7d1057ce1800f6640f5ac64efecfe63c47cb",
+      "license": "CC-BY-4.0",
+      "name": "Our World in Data articles",
+      "policy_snapshots": [
+        {
+          "content_type": "text/plain; charset=utf-8",
+          "label": "robots_url",
+          "path": "data/source_samples/20260727T235857Z/our_world_in_data/policy/robots_url.txt",
+          "sha256": "dd66a7b7888edfafbcbe567ec3aa7bbfc50aee74ed3ebe2ad20a47a539c24ebf",
+          "url": "https://ourworldindata.org/robots.txt"
+        },
+        {
+          "content_type": "text/html; charset=utf-8",
+          "label": "license",
+          "path": "data/source_samples/20260727T235857Z/our_world_in_data/policy/license.html",
+          "sha256": "8c6b840c3c9ab00fa2bc075213c52ce29b766a7c9346fee87a732cc5d03ba457",
+          "url": "https://ourworldindata.org/faqs"
+        }
+      ],
+      "redistribution": "redistributable",
+      "status": "complete",
+      "tier": "A"
+    },
+    "plos": {
+      "acquisition": {
+        "api_url": "https://api.plos.org/search?q=%2A%3A%2A&fq=doc_type%3Afull&fl=id%2Ctitle_display%2Cabstract%2Ceverything%2Cpublication_date&rows=48&start=239035&wt=json",
+        "start": 239035,
+        "total_documents": 412962
+      },
+      "acquisition_kind": "plos_api",
+      "character_count": 593695,
+      "document_count": 12,
+      "documents_path": "data/source_samples/20260727T235857Z/plos/documents.jsonl",
+      "documents_sha256": "e6affe67aef9873f14da12a04ca4d998d74c6a2ddb4865ea35622799c2187867",
+      "license": "CC-BY-4.0",
+      "name": "PLOS research articles",
+      "policy_snapshots": [
+        {
+          "content_type": "text/html; charset=UTF-8",
+          "label": "license",
+          "path": "data/source_samples/20260727T235857Z/plos/policy/license.html",
+          "sha256": "86a8395c50d548e0f8d163b81474f52a59558caf3a8176c60ff6fbecc778ff51",
+          "url": "https://plos.org/terms-of-use/"
+        }
+      ],
+      "redistribution": "redistributable",
+      "status": "complete",
+      "tier": "A"
+    },
+    "public_domain_review": {
+      "acquisition": {
+        "dataset_id": "common-pile/public_domain_review",
+        "revision": "e9c7669206b95871601fe4672a484d8215e6fe6f",
+        "split": "train"
+      },
+      "acquisition_kind": "huggingface",
+      "character_count": 45766,
+      "document_count": 12,
+      "documents_path": "data/source_samples/20260727T235857Z/public_domain_review/documents.jsonl",
+      "documents_sha256": "b5e7e4ea712ba19ce6775ba7afcfec1de82013dd5400c166ceb6544004715e07",
+      "license": "CC-BY-SA-4.0",
+      "name": "Public Domain Review essays",
+      "policy_snapshots": [
+        {
+          "content_type": "text/html; charset=UTF-8",
+          "label": "license",
+          "path": "data/source_samples/20260727T235857Z/public_domain_review/policy/license.html",
+          "sha256": "ee7f74fd94df90feb377176a82eee275e3d416f40fed06ffd1841fdd8eef7f45",
+          "url": "https://publicdomainreview.org/about/"
+        }
+      ],
+      "redistribution": "redistributable",
+      "status": "complete",
+      "tier": "A"
+    },
+    "standard_ebooks": {
+      "acquisition": {
+        "api_url": "https://api.github.com/orgs/standardebooks/repos?per_page=100&type=public&sort=full_name",
+        "repositories": [
+          {
+            "archive_sha256": "3d2eb9ab859f441149f67ba00a1fa8d5fd159183ca298f7123f530f4f284f74e",
+            "repository": "standardebooks/alexandre-dumas_twenty-years-after_estes-and-lauriat"
+          },
+          {
+            "archive_sha256": "2472d17808c07bd0c97e84b4ff82d10dd2ca047056e5e57a19328901f30c4358",
+            "repository": "standardebooks/a-e-w-mason_the-four-feathers"
+          },
+          {
+            "archive_sha256": "98d4ead6979e77657b61978ab090e854bcc9d27fe7cd06e20ac15b9bc7c5657d",
+            "repository": "standardebooks/anna-katharine-green_a-strange-disappearance"
+          },
+          {
+            "archive_sha256": "2b1a450d13b03413efbb290d97257046ad12691bbc7e183819e6fbb5c23a925e",
+            "repository": "standardebooks/alexandre-dumas_the-three-musketeers_william-robson"
+          },
+          {
+            "archive_sha256": "98589e857abd300e7286778eb9f54952cd5778166a61fe06caa366b6362a8afb",
+            "repository": "standardebooks/andre-gide_the-counterfeiters_dorothy-bussy"
+          },
+          {
+            "archive_sha256": "f673d5bd608c48a1bb6d66524a4f3aafbaf3156dbd1d4271d7381f58ec18199a",
+            "repository": "standardebooks/alexandre-dumas_the-count-of-monte-cristo_chapman-and-hall"
+          },
+          {
+            "archive_sha256": "d48a33a4c7b6b65563e615d9f7dca652a0437a62b6d06400d20ef32bfe55a18b",
+            "repository": "standardebooks/andre-norton_plague-ship"
+          },
+          {
+            "archive_sha256": "ccdebfd55e8fdca7dc17bf20e565d992a8e894306eb08827dd2187b845ba66a2",
+            "repository": "standardebooks/anonymous_beowulf_john-lesslie-hall"
+          },
+          {
+            "archive_sha256": "6a1b8dd12dc9f4d1bfc383b9b7ca5f4406285ceb3e84390c223568622136d493",
+            "repository": "standardebooks/ameen-rihani_poetry"
+          },
+          {
+            "archive_sha256": "10b78ea2d32bea4e81f8c5c937d54d0153b7832499306ace42c105618ba9a1ad",
+            "repository": "standardebooks/aldous-huxley_point-counter-point"
+          },
+          {
+            "archive_sha256": "ac6ae63e85412ad62434c238be7da837fd7f39ae467bc9fad607028a53b4ac7b",
+            "repository": "standardebooks/ann-radcliffe_the-mysteries-of-udolpho"
+          },
+          {
+            "archive_sha256": "1f3190fcfbaaf02e17c9b23292128ea723d053979e6ae77cfa2d831bc2b3a9cd",
+            "repository": "standardebooks/alexander-pushkin_eugene-onegin_henry-spalding"
+          }
+        ]
+      },
+      "acquisition_kind": "github_org_epubs",
+      "character_count": 719949,
+      "document_count": 12,
+      "documents_path": "data/source_samples/20260727T235857Z/standard_ebooks/documents.jsonl",
+      "documents_sha256": "743ecd3e7e64dd968e55ca73a1274faa9c97b37e20f76f9b6f06cac696a91a82",
+      "license": "CC0-1.0",
+      "name": "Standard Ebooks",
+      "policy_snapshots": [
+        {
+          "content_type": "application/xhtml+xml; charset=utf-8",
+          "label": "license",
+          "path": "data/source_samples/20260727T235857Z/standard_ebooks/policy/license.html",
+          "sha256": "d879a188aaf20b62a4e11219bd75bb97e92ae6cd7a1956f85397b6093cfd39f0",
+          "url": "https://standardebooks.org/about/standard-ebooks-and-the-public-domain"
+        }
+      ],
+      "redistribution": "redistributable",
+      "status": "complete",
+      "tier": "A"
+    }
+  }
+}

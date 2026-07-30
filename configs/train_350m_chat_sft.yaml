@@ -1,0 +1,110 @@
+# Template for the first conversational SFT bakeoff. This is intentionally
+# non-runnable until the immutable chat corpus and matching 350M base checkpoint
+# exist at the explicit paths below.
+data:
+  block_size: 2048
+  dtype: uint16
+  vocab_size: 32000
+  train_bin: null
+  val_bin: null
+  hf_repo: null
+  indexed:
+    enabled: true
+    train_dir: data/chat/v1/train
+    val_dir: data/chat/v1/validation
+    tokenizer_sha256: null
+    recipe_sha256: null
+    verify_hashes: true
+    source_weights: null
+    validation_source_weights: null
+  streaming:
+    enabled: false
+
+data_prep:
+  tokenizer_model: tokenizer/spm.model
+
+training:
+  # This starts a fresh optimizer while loading fingerprint-validated base
+  # weights. Exact SFT resume still uses --resume_from.
+  initialize_from: runs/gpt-350m-base/final
+  seed: 1337
+  micro_batch_size: 2
+  grad_accum_steps: 32
+  learning_rate: 2.0e-5
+  weight_decay: 0.0
+  betas: [0.9, 0.95]
+  warmup_steps: 100
+  max_steps: 1000
+  eval_interval: 100
+  log_interval: 10
+  save_interval: 250
+  output_dir: runs/gpt-350m-chat-sft
+  precision: bf16
+  max_grad_norm: 1.0
+  gradient_checkpointing: true
+  allow_tf32: true
+  checkpoint_limit: 2
+
+checkpoint_slots:
+  best: 1
+  good: []
+
+checkpoint_upload:
+  enabled: false
+  repo_id: null
+  local_checkpoint_mode: persistent
+  keep_local_final: true
+  retry_max_attempts: 3
+  retry_backoff_seconds: 5
+  verify_upload: true
+  retention:
+    enabled: false
+
+logging:
+  enabled: true
+  console_summary: true
+  log_file: auto
+  tensorboard:
+    enabled: false
+    log_dir: null
+  wandb:
+    enabled: false
+    project: gpt-training-lab
+    name: null
+    entity: null
+    tags: [post-training, chat, sft]
+    group: null
+    config: null
+
+observability:
+  enabled: true
+  heartbeat_interval_steps: 10
+  state_file: run_state.json
+  events_file: events.jsonl
+  metrics_file: metrics.jsonl
+  budget_alarm_fractions: [0.50, 0.80, 0.95]
+
+runtime_control:
+  enabled: true
+  control_path: null
+  command_path: null
+  cursor_path: null
+  poll_interval_steps: 10
+
+budget:
+  target_tokens: 0
+  hourly_rate: 0.0
+  max_cost: 0.0
+  throughput_path: null
+
+checks:
+  source_eval:
+    enabled: true
+    batches: 20
+  overfit_microset:
+    enabled: false
+  # The pretraining sampler is not chat-aware. Conversation evaluation is run
+  # with `uv run conversation-eval generate-local` at selected checkpoints.
+  fixed_prompt:
+    enabled: false
+    tokenizer_model: tokenizer/spm.model

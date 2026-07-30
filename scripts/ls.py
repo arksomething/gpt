@@ -4,12 +4,14 @@
 COMMANDS = [
     {
         "name": "train",
-        "description": "Train a ~100M parameter Llama-style model.",
+        "description": "Run controlled language-model training experiments toward 1B scale.",
         "args": [
             ("--model_config", "configs/model_100m.yaml", "Model architecture config file"),
             ("--train_config", "configs/train.yaml", "Training hyperparameters config file"),
             ("--resume_from", "None", "Path to checkpoint directory to resume from"),
             ("--resume_from_slot", "None", "Resume from named slot (last, best, good_1, etc.)"),
+            ("--resume_from_hf", "None", "Remote selector (latest, best, final, step_XXXXXXX)"),
+            ("--initialize_from", "None", "Validated base checkpoint for a fresh run"),
             ("--smoke", "False", "Quick smoke test run (max 50 steps)"),
             ("--launch_screen", "False", "Auto-launch in screen/tmux session"),
             ("--screen_name", "None", "Custom session name for screen/tmux"),
@@ -21,7 +23,7 @@ COMMANDS = [
         "args": [
             ("--model_config", "configs/model_100m.yaml", "Model architecture config file"),
             ("--train_config", "configs/train.yaml", "Training config (for eval defaults)"),
-            ("--checkpoint", "runs/llama-100m/final", "Path to checkpoint directory"),
+            ("--checkpoint", "runs/llama-100m-v3/final", "Path to checkpoint directory"),
             ("--tokenizer_model", "tokenizer/spm.model", "SentencePiece model file"),
             ("--batches", "200", "Number of eval batches for loss calculation"),
             ("--prompt", "The quick brown fox", "Text prompt for generation"),
@@ -39,7 +41,7 @@ COMMANDS = [
         "args": [
             ("--config", "configs/train.yaml", "Config file with data_prep section"),
             ("--tokenizer_model", "tokenizer/spm.model", "SentencePiece model file"),
-            ("--out_dir", "data", "Output directory for .bin files"),
+            ("--out_dir", "data/v3", "Output directory for .bin files"),
             ("--train_tokens", "2_000_000_000", "Target number of training tokens"),
             ("--val_tokens", "20_000_000", "Target number of validation tokens"),
             ("--c4_weight", "0.30", "C4 dataset sampling weight"),
@@ -87,8 +89,8 @@ COMMANDS = [
         "description": "Inspect tokenizer and sample from tokenized data.",
         "args": [
             ("--tokenizer_model", "tokenizer/spm.model", "SentencePiece model file"),
-            ("--train_bin", "data/train.bin", "Training data .bin file"),
-            ("--val_bin", "data/val.bin", "Validation data .bin file"),
+            ("--train_bin", "data/v3/train.bin", "Training data .bin file"),
+            ("--val_bin", "data/v3/val.bin", "Validation data .bin file"),
             ("--dtype", "uint16", "Data type of .bin files"),
             ("--seed", "1337", "Random seed for sampling"),
             ("--encode", "None", "Text to encode (one-shot mode)"),
@@ -142,11 +144,11 @@ def main():
     print("\nExamples:")
     print("  uv run train --smoke                    # Quick test run")
     print("  uv run train --launch_screen            # Train in background")
-    print("  uv run eval --checkpoint runs/llama-100m/step_0010000")
+    print("  uv run eval --checkpoint runs/llama-100m-v3/hf-eval")
     print("  uv run prepare-data --train_tokens 1_000_000_000")
     print("  uv run benchmark --steps 100")
     print("  uv run tokenizer-repl --sample --count 5")
-    print("  uv run scan-bins --train data/train.bin --val data/val.bin")
+    print("  uv run scan-bins --train data/v3/train.bin --val data/v3/val.bin")
     print()
 
 

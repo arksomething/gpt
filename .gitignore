@@ -11,6 +11,7 @@ __pycache__/
 
 # Training outputs
 /runs/
+/archive/local/
 *.log
 **/.hf_resume/
 **/.tmp_checkpoints/
@@ -20,6 +21,16 @@ __pycache__/
 
 # Large binary datasets/checkpoints
 /data/
+# Keep the source registry and generated acquisition manifests reviewable while
+# leaving downloaded text, token shards, and other large data ignored.
+!/data/
+/data/*
+!/data/sources.yaml
+!/data/source_samples/
+/data/source_samples/*
+!/data/source_samples/*/
+/data/source_samples/*/*
+!/data/source_samples/*/manifest.json
 *.pt
 *.ckpt
 *.safetensors

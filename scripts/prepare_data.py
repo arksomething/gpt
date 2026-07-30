@@ -36,8 +36,8 @@ import threading
 import time
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from typing import Callable, Iterator, List, Optional
 
 import numpy as np
@@ -53,6 +53,12 @@ from scripts.filters import (
     apply_global_filters,
     apply_wiki_filters,
     chunk_text,
+)
+from scripts.canonical_writing import iter_canonical_manifest
+from scripts.indexed_shards import (
+    ResumableIndexedShardWriter,
+    Source,
+    content_hash,
 )
 
 
@@ -138,7 +144,7 @@ def maybe_launch_screen(enabled: bool, session_name: Optional[str] = None) -> bo
 @dataclass
 class Checkpoint:
     """Checkpoint state for resuming."""
-    
+
     phase: str  # "train" or "val"
     tokens_written: int
     docs_processed: int
@@ -148,7 +154,8 @@ class Checkpoint:
     dedup_rejects: int
     elapsed_seconds: float
     timestamp: str
-    
+    tokenizer_sha256: Optional[str] = None
+
     def to_dict(self) -> dict:
         return {
             "phase": self.phase,
@@ -162,8 +169,9 @@ class Checkpoint:
             "dedup_rejects": self.dedup_rejects,
             "elapsed_seconds": self.elapsed_seconds,
             "timestamp": self.timestamp,
+            "tokenizer_sha256": self.tokenizer_sha256,
         }
-    
+
     @classmethod
     def from_dict(cls, d: dict) -> "Checkpoint":
         return cls(
@@ -176,6 +184,7 @@ class Checkpoint:
             dedup_rejects=d["dedup_rejects"],
             elapsed_seconds=d["elapsed_seconds"],
             timestamp=d["timestamp"],
+            tokenizer_sha256=d.get("tokenizer_sha256"),
         )
 
 
@@ -399,12 +408,22 @@ class FilterConfig:
         )
 
 
+@dataclass(frozen=True)
+class PreparedDocument:
+    """A tokenized document with provenance retained through shuffling."""
+
+    tokens: List[int]
+    source_id: str
+    content_sha256: str
+    metadata: dict
+
+
 class ShuffleBuffer:
     """Buffer for streaming shuffle."""
 
     def __init__(self, size: int, seed: int = 42):
-        self.size = size
-        self.buffer: deque = deque(maxlen=size)
+        self.size = max(1, int(size))
+        self.buffer: deque = deque(maxlen=self.size)
         self.rng = random.Random(seed)
 
     def add_and_maybe_yield(self, item) -> Optional[any]:
@@ -577,6 +596,37 @@ def filter_and_transform_fineweb(
     return chunks
 
 
+def filter_and_transform_generic(
+    text: str,
+    source_id: str,
+    filter_cfg: FilterConfig,
+    stats: FilterStats,
+) -> List[str]:
+    passed, reason = apply_global_filters(
+        text,
+        min_chars=filter_cfg.min_chars,
+        max_chars=filter_cfg.max_chars,
+        min_alpha_ratio=filter_cfg.min_alpha_ratio,
+        max_repeat=filter_cfg.max_repeated_chars,
+        max_weird_ratio=filter_cfg.max_weird_ratio,
+        max_short_line_ratio=filter_cfg.max_short_line_ratio,
+        max_caps_ratio=filter_cfg.max_caps_ratio,
+    )
+    if not passed:
+        stats.record_reject(f"{source_id}_{reason}")
+        return []
+    chunks = chunk_text(
+        text,
+        filter_cfg.max_chunk_chars,
+        filter_cfg.min_chunk_chars,
+    )
+    if chunks:
+        stats.record_pass()
+    else:
+        stats.record_reject("chunk_too_small")
+    return chunks
+
+
 # =============================================================================
 # Source Interleaving
 # =============================================================================
@@ -656,6 +706,79 @@ def interleave_sources(
                     pass
 
 
+def interleave_named_sources(
+    lanes: dict[str, tuple[Iterator[tuple[str, str, dict]], float]],
+    *,
+    seed: int,
+) -> Iterator[tuple[str, str, dict]]:
+    """Deterministically interleave arbitrary provenance-carrying source lanes."""
+    active = {
+        name: {"iterator": iterator, "weight": float(weight)}
+        for name, (iterator, weight) in lanes.items()
+        if float(weight) > 0
+    }
+    rng = random.Random(seed)
+    try:
+        while active:
+            names = sorted(active)
+            total = sum(active[name]["weight"] for name in names)
+            roll = rng.random() * total
+            selected = names[-1]
+            cumulative = 0.0
+            for name in names:
+                cumulative += active[name]["weight"]
+                if roll < cumulative:
+                    selected = name
+                    break
+            try:
+                yield next(active[selected]["iterator"])
+            except StopIteration:
+                del active[selected]
+    finally:
+        for lane in active.values():
+            close_iter = getattr(lane["iterator"], "close", None)
+            if callable(close_iter):
+                try:
+                    close_iter()
+                except Exception:
+                    pass
+
+
+def partition_documents(
+    source_iter: Iterator[tuple],
+    *,
+    split: str,
+    validation_fraction: float,
+    seed: int,
+) -> Iterator[tuple]:
+    """Assign each raw document to exactly one deterministic content split."""
+    if split not in {"train", "validation"}:
+        raise ValueError("split must be 'train' or 'validation'")
+    if not 0.0 < validation_fraction < 1.0:
+        raise ValueError("validation_fraction must be between 0 and 1")
+    threshold = int(validation_fraction * (1 << 64))
+    salt = int(seed).to_bytes(8, byteorder="little", signed=True)
+    try:
+        for item in source_iter:
+            source_id, text = item[:2]
+            digest = hashlib.blake2b(
+                text.encode("utf-8"),
+                digest_size=8,
+                key=salt,
+            ).digest()
+            bucket = int.from_bytes(digest, byteorder="big", signed=False)
+            is_validation = bucket < threshold
+            if (split == "validation") == is_validation:
+                yield item
+    finally:
+        close_iter = getattr(source_iter, "close", None)
+        if callable(close_iter):
+            try:
+                close_iter()
+            except Exception:
+                pass
+
+
 # =============================================================================
 # Main Processing
 # =============================================================================
@@ -683,6 +806,55 @@ class GracefulInterrupt:
         self.interrupted = True
 
 
+def verify_flat_resume_provenance(
+    out_dir: str,
+    bin_paths: List[str],
+    tokenizer_sha256: str,
+    checkpoint: Optional["Checkpoint"],
+) -> None:
+    """Refuse to resume onto flat .bin files whose tokenizer provenance is
+    absent or different from the tokenizer in use.
+
+    Provenance is accepted from either a completed run's data_meta.json or an
+    in-progress run's checkpoint. Existing bins with neither, or with a
+    mismatched hash, abort the run: silently appending tokens from a second
+    tokenizer produced the unusable v3 val.bin.
+    """
+    existing = [p for p in bin_paths if os.path.exists(p) and os.path.getsize(p) > 0]
+    if not existing:
+        return
+
+    recorded = None
+    provenance = None
+    meta_path = os.path.join(out_dir, "data_meta.json")
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                recorded = json.load(f).get("tokenizer_sha256")
+            provenance = meta_path
+        except (json.JSONDecodeError, OSError):
+            pass
+    if recorded is None and checkpoint is not None and checkpoint.tokenizer_sha256:
+        recorded = checkpoint.tokenizer_sha256
+        provenance = "checkpoint"
+
+    names = ", ".join(os.path.basename(p) for p in existing)
+    if recorded is None:
+        raise SystemExit(
+            f"[resume] Refusing to resume: {names} exist in {out_dir} but no "
+            "tokenizer provenance was found in data_meta.json or the "
+            "checkpoint. Re-run with --overwrite to regenerate."
+        )
+    if recorded.lower() != tokenizer_sha256.lower():
+        raise SystemExit(
+            f"[resume] Tokenizer mismatch: {provenance} records "
+            f"{recorded[:16]}... but the current tokenizer is "
+            f"{tokenizer_sha256[:16]}.... Existing {names} would mix token "
+            "vocabularies. Re-run with --overwrite, or restore the original "
+            "tokenizer."
+        )
+
+
 def count_tokens_in_file(path: str, dtype: np.dtype, cap_at: Optional[int] = None) -> int:
     """Return aligned token count for an existing binary file."""
     if not os.path.exists(path):
@@ -708,6 +880,25 @@ def count_tokens_in_file(path: str, dtype: np.dtype, cap_at: Optional[int] = Non
         os.truncate(path, cap_at * bytes_per_token)
         tokens = cap_at
     return int(tokens)
+
+
+def indexed_manifest_tokens(corpus_dir: str) -> int:
+    manifest_path = os.path.join(corpus_dir, "manifest.json")
+    if not os.path.exists(manifest_path):
+        return 0
+    manifest = _load_json_manifest(manifest_path)
+    return int(manifest.get("token_count", 0))
+
+
+def _load_json_manifest(path: str) -> dict:
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            value = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"Invalid indexed staging manifest {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise SystemExit(f"Invalid indexed staging manifest {path}")
+    return value
 
 
 _TOKENIZER_TLS = threading.local()
@@ -747,7 +938,7 @@ def _tokenize_chunk_worker(
 
 
 def write_tokens_to_memmap(
-    tokens_iter: Iterator[List[int]],
+    tokens_iter: Iterator[PreparedDocument | List[int]],
     output_path: str,
     target_tokens: int,
     dtype: np.dtype,
@@ -759,6 +950,7 @@ def write_tokens_to_memmap(
     interrupt_handler: Optional[GracefulInterrupt] = None,
     phase: str = "train",
     resume_existing_tokens: int = 0,
+    tokenizer_sha256: Optional[str] = None,
 ) -> tuple:
     """
     Write tokenized documents to binary file with crash-safe append semantics.
@@ -782,6 +974,15 @@ def write_tokens_to_memmap(
         unit_scale=True,
     )
 
+    existing_tokens_view = None
+    if resume_existing_tokens > 0:
+        existing_tokens_view = np.memmap(
+            output_path,
+            dtype=dtype,
+            mode="r",
+            shape=(resume_existing_tokens,),
+        )
+
     with open(output_path, mode) as f:
         try:
             if resume_existing_tokens > 0:
@@ -791,20 +992,37 @@ def write_tokens_to_memmap(
                     flush=True,
                 )
                 while replayed_tokens < resume_existing_tokens:
-                    tokens = next(tokens_iter)
-                    replayed_tokens += len(tokens) + 1
-                    doc_count += 1
-                    if replayed_tokens > resume_existing_tokens:
+                    item = next(tokens_iter)
+                    tokens = item.tokens if isinstance(item, PreparedDocument) else item
+                    write_len = len(tokens) + 1
+                    replay_stop = replayed_tokens + write_len
+                    if replay_stop > resume_existing_tokens:
                         raise SystemExit(
-                            "Resume mismatch: regenerated stream does not align with existing output. "
-                            "Use --overwrite to restart cleanly."
+                            "Resume mismatch: regenerated document boundaries do "
+                            "not align with existing output. Use --overwrite."
                         )
+                    expected = np.empty(write_len, dtype=dtype)
+                    expected[:-1] = tokens
+                    expected[-1] = eos_token_id
+                    assert existing_tokens_view is not None
+                    if not np.array_equal(
+                        existing_tokens_view[replayed_tokens:replay_stop],
+                        expected,
+                    ):
+                        raise SystemExit(
+                            "Resume mismatch: regenerated tokens differ from the "
+                            "existing output. The source, split, tokenizer, or "
+                            "recipe changed; use --overwrite."
+                        )
+                    replayed_tokens = replay_stop
+                    doc_count += 1
                 print(
                     f"[resume] Replay complete at {replayed_tokens:,} tokens.",
                     flush=True,
                 )
 
-            for tokens in tokens_iter:
+            for item in tokens_iter:
+                tokens = item.tokens if isinstance(item, PreparedDocument) else item
                 if position >= target_tokens:
                     break
 
@@ -851,7 +1069,8 @@ def write_tokens_to_memmap(
                         fineweb_docs=stats["fineweb"].total_docs if stats else 0,
                         dedup_rejects=stats.get("dedup_rejects", 0) if stats else 0,
                         elapsed_seconds=elapsed,
-                        timestamp=datetime.utcnow().isoformat() + "Z",
+                        timestamp=datetime.now(timezone.utc).isoformat(),
+                        tokenizer_sha256=tokenizer_sha256,
                     )
                     save_checkpoint(checkpoint, checkpoint_path)
                     f.flush()
@@ -861,6 +1080,8 @@ def write_tokens_to_memmap(
             f.flush()
             os.fsync(f.fileno())
             pbar.close()
+            if existing_tokens_view is not None:
+                del existing_tokens_view
 
     # Ensure file length exactly matches token count.
     expected_bytes = position * bytes_per_token
@@ -879,7 +1100,8 @@ def write_tokens_to_memmap(
             fineweb_docs=stats["fineweb"].total_docs if stats else 0,
             dedup_rejects=stats.get("dedup_rejects", 0) if stats else 0,
             elapsed_seconds=elapsed,
-            timestamp=datetime.utcnow().isoformat() + "Z",
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            tokenizer_sha256=tokenizer_sha256,
         )
         save_checkpoint(checkpoint, checkpoint_path)
 
@@ -891,6 +1113,134 @@ def write_tokens_to_memmap(
             pass
 
     return position, was_interrupted
+
+
+def write_documents_to_indexed(
+    documents_iter: Iterator[PreparedDocument],
+    output_dir: str,
+    target_tokens: int,
+    token_dtype: str,
+    eos_token_id: int,
+    tokenizer_sha256: str,
+    recipe_sha256: str,
+    sources: List[Source],
+    target_shard_tokens: int,
+    checkpoint_interval: int = 60,
+    log_interval: int = 30,
+    interrupt_handler: Optional[GracefulInterrupt] = None,
+    split: str = "train",
+    resume: bool = False,
+) -> tuple[int, bool, Optional[str]]:
+    """Transactionally publish an indexed corpus.
+
+    Interrupted builds are aborted rather than exposing a partial immutable
+    corpus. Resume support requires a separate resumable staging format and is
+    intentionally not simulated here.
+    """
+    position = 0
+    document_count = 0
+    start_time = time.time()
+    last_log_time = start_time
+    last_checkpoint_time = start_time
+    was_interrupted = False
+    writer = ResumableIndexedShardWriter(
+        output_dir,
+        sources=sources,
+        tokenizer_sha256=tokenizer_sha256,
+        recipe_sha256=recipe_sha256,
+        token_dtype=token_dtype,
+        target_shard_tokens=target_shard_tokens,
+        metadata={
+            "split": split,
+            "target_tokens": int(target_tokens),
+            "eos_token_id": int(eos_token_id),
+        },
+        resume=resume,
+    )
+    position = writer.token_count
+    document_count = writer.document_count
+
+    try:
+        for committed in writer.existing_documents:
+            try:
+                replayed = next(documents_iter)
+            except StopIteration as exc:
+                raise SystemExit(
+                    f"Indexed {split} resume mismatch: source stream ended while "
+                    "replaying the committed prefix."
+                ) from exc
+            replayed_tokens = np.asarray(
+                [*replayed.tokens, eos_token_id],
+                dtype=np.dtype(token_dtype),
+            )
+            committed_tokens = writer.read_committed_tokens(
+                committed.document_id
+            )
+            if (
+                replayed.source_id != committed.source_id
+                or replayed.content_sha256 != committed.content_sha256
+                or not np.array_equal(replayed_tokens, committed_tokens)
+            ):
+                raise SystemExit(
+                    f"Indexed {split} resume mismatch at document "
+                    f"{committed.document_id}. The source, split, tokenizer, "
+                    "filtering, or recipe changed; restart with --overwrite."
+                )
+
+        for document in documents_iter:
+            if interrupt_handler and interrupt_handler.interrupted:
+                was_interrupted = True
+                break
+            tokens = [*document.tokens, eos_token_id]
+            if position + len(tokens) > target_tokens:
+                break
+            writer.add_document(
+                tokens,
+                source_id=document.source_id,
+                content_sha256=document.content_sha256,
+                metadata=document.metadata,
+            )
+            position += len(tokens)
+            document_count += 1
+
+            now = time.time()
+            if now - last_log_time >= log_interval:
+                elapsed = now - start_time
+                tokens_per_second = position / max(elapsed, 1e-6)
+                print(
+                    f"[indexed:{split}] {position:,}/{target_tokens:,} tokens "
+                    f"({position / target_tokens * 100:.1f}%) | "
+                    f"{document_count:,} docs | {tokens_per_second:,.0f} tok/s",
+                    flush=True,
+                )
+                last_log_time = now
+            if now - last_checkpoint_time >= checkpoint_interval:
+                writer.checkpoint()
+                last_checkpoint_time = now
+    except BaseException:
+        writer.discard_uncommitted()
+        raise
+    finally:
+        close_iter = getattr(documents_iter, "close", None)
+        if callable(close_iter):
+            try:
+                close_iter()
+            except Exception:
+                pass
+
+    if was_interrupted:
+        writer.suspend()
+        return position, True, None
+    if document_count == 0:
+        writer.discard_uncommitted()
+        raise SystemExit(
+            f"Indexed {split} build produced no documents before target limit."
+        )
+    corpus_path = writer.close()
+    corpus_fingerprint = json.loads(
+        (corpus_path / "manifest.json").read_text(encoding="utf-8")
+    )["corpus_sha256"]
+    return position, False, corpus_fingerprint
 
 
 def process_and_tokenize(
@@ -905,7 +1255,7 @@ def process_and_tokenize(
     tokenizer_workers: int = 1,
     tokenizer_prefetch: int = 256,
     tokenizer_model_path: Optional[str] = None,
-) -> Iterator[List[int]]:
+) -> Iterator[PreparedDocument]:
     """Process documents: filter, deduplicate, tokenize."""
     shuffle_buffer = ShuffleBuffer(shuffle_buffer_size, seed)
     dedup_rejects = 0
@@ -947,6 +1297,21 @@ def process_and_tokenize(
             return None
         return tokens
 
+    def prepared_document(
+        source_id: str,
+        text: str,
+        tokens: List[int],
+        metadata: Optional[dict] = None,
+    ) -> PreparedDocument:
+        document_metadata = dict(metadata or {})
+        document_metadata["chunk_characters"] = len(text)
+        return PreparedDocument(
+            tokens=tokens,
+            source_id=source_id,
+            content_sha256=content_hash(text),
+            metadata=document_metadata,
+        )
+
     def log_filter_progress():
         """Log current filter statistics."""
         nonlocal last_log_time
@@ -955,59 +1320,66 @@ def process_and_tokenize(
             return
         last_log_time = now
 
-        total_seen = stats["c4"].total_docs + stats["wiki"].total_docs + stats["fineweb"].total_docs
-        c4_pass = stats["c4"].passed_docs
-        wiki_pass = stats["wiki"].passed_docs
-        fineweb_pass = stats["fineweb"].passed_docs
-
-        c4_rate = (c4_pass / stats["c4"].total_docs * 100) if stats["c4"].total_docs > 0 else 0
-        wiki_rate = (wiki_pass / stats["wiki"].total_docs * 100) if stats["wiki"].total_docs > 0 else 0
-        fineweb_rate = (
-            fineweb_pass / stats["fineweb"].total_docs * 100
-            if stats["fineweb"].total_docs > 0
-            else 0
-        )
+        source_stats = {
+            source_id: value
+            for source_id, value in stats.items()
+            if isinstance(value, FilterStats)
+        }
+        total_seen = sum(value.total_docs for value in source_stats.values())
+        passed = []
+        for source_id, value in source_stats.items():
+            rate = (
+                value.passed_docs / value.total_docs * 100
+                if value.total_docs
+                else 0
+            )
+            passed.append(
+                f"{source_id} {value.passed_docs:,} ({rate:.1f}%)"
+            )
 
         print(
             f"[filter] Seen {total_seen:,} docs | "
-            f"Passed: C4 {c4_pass:,} ({c4_rate:.1f}%), "
-            f"Wiki {wiki_pass:,} ({wiki_rate:.1f}%), "
-            f"FineWeb {fineweb_pass:,} ({fineweb_rate:.1f}%) | "
+            f"Passed: {', '.join(passed)} | "
             f"Yielded: {docs_yielded:,} | "
             f"Dedup: {dedup_rejects:,} | UNK: {unk_rejects:,}",
             flush=True
         )
 
-    pending_futures: deque[Future] = deque()
+    pending_futures: deque[tuple[Future, str, str, dict]] = deque()
     executor: Optional[ThreadPoolExecutor] = None
 
-    def submit_tokenization(chunk: str):
+    def submit_tokenization(source_id: str, chunk: str, metadata: dict):
         if executor is None:
             return
         pending_futures.append(
-            executor.submit(
-                _tokenize_chunk_worker,
+            (
+                executor.submit(
+                    _tokenize_chunk_worker,
+                    chunk,
+                    tokenizer_model_path,
+                    max_unk_ratio,
+                    _SHORT_DOC_UNK_TOKEN_LIMIT,
+                ),
+                source_id,
                 chunk,
-                tokenizer_model_path,
-                max_unk_ratio,
-                _SHORT_DOC_UNK_TOKEN_LIMIT,
+                metadata,
             )
         )
 
-    def drain_futures(block: bool) -> Iterator[List[int]]:
+    def drain_futures(block: bool) -> Iterator[PreparedDocument]:
         nonlocal unk_rejects, docs_yielded
         while pending_futures:
-            future = pending_futures[0]
+            future, source_id, chunk, metadata = pending_futures[0]
             if not block and not future.done():
                 break
 
-            future = pending_futures.popleft()
+            future, source_id, chunk, metadata = pending_futures.popleft()
             tokens, unk_rejected = future.result()
             if unk_rejected:
                 unk_rejects += 1
             if tokens:
                 docs_yielded += 1
-                yield tokens
+                yield prepared_document(source_id, chunk, tokens, metadata)
 
             if block:
                 break
@@ -1019,7 +1391,13 @@ def process_and_tokenize(
                 thread_name_prefix="tok",
             )
 
-        for source_name, text in source_iter:
+        for source_item in source_iter:
+            source_name, text = source_item[:2]
+            upstream_metadata = (
+                dict(source_item[2])
+                if len(source_item) > 2 and isinstance(source_item[2], dict)
+                else {}
+            )
             if source_name == "c4":
                 chunks = filter_and_transform_c4(text, filter_cfg, stats["c4"])
             elif source_name == "wiki":
@@ -1027,34 +1405,59 @@ def process_and_tokenize(
             elif source_name == "fineweb":
                 chunks = filter_and_transform_fineweb(text, filter_cfg, stats["fineweb"])
             else:
-                continue
+                source_stats = stats.setdefault(source_name, FilterStats())
+                chunks = filter_and_transform_generic(
+                    text,
+                    source_name,
+                    filter_cfg,
+                    source_stats,
+                )
 
             # Log progress periodically
             log_filter_progress()
 
-            for chunk in chunks:
+            parent_content_sha256 = content_hash(text)
+            for chunk_index, chunk in enumerate(chunks):
                 if deduplicator is not None and deduplicator.is_duplicate(chunk):
                     dedup_rejects += 1
                     continue
 
-                result = shuffle_buffer.add_and_maybe_yield(chunk)
+                chunk_metadata = {
+                    **upstream_metadata,
+                    "parent_content_sha256": parent_content_sha256,
+                    "chunk_index": chunk_index,
+                    "chunk_count": len(chunks),
+                }
+                result = shuffle_buffer.add_and_maybe_yield(
+                    (source_name, chunk, chunk_metadata)
+                )
                 if result is None:
                     continue
+                result_source, result_chunk, result_metadata = result
 
                 if use_parallel_tokenization:
-                    submit_tokenization(result)
+                    submit_tokenization(
+                        result_source,
+                        result_chunk,
+                        result_metadata,
+                    )
                     while len(pending_futures) >= tokenizer_prefetch:
                         yield from drain_futures(block=True)
                     yield from drain_futures(block=False)
                 else:
-                    tokens = tokenize_and_filter_local(result)
+                    tokens = tokenize_and_filter_local(result_chunk)
                     if tokens:
                         docs_yielded += 1
-                        yield tokens
+                        yield prepared_document(
+                            result_source,
+                            result_chunk,
+                            tokens,
+                            result_metadata,
+                        )
 
-        for chunk in shuffle_buffer.flush():
+        for source_name, chunk, chunk_metadata in shuffle_buffer.flush():
             if use_parallel_tokenization:
-                submit_tokenization(chunk)
+                submit_tokenization(source_name, chunk, chunk_metadata)
                 while len(pending_futures) >= tokenizer_prefetch:
                     yield from drain_futures(block=True)
                 yield from drain_futures(block=False)
@@ -1062,7 +1465,12 @@ def process_and_tokenize(
                 tokens = tokenize_and_filter_local(chunk)
                 if tokens:
                     docs_yielded += 1
-                    yield tokens
+                    yield prepared_document(
+                        source_name,
+                        chunk,
+                        tokens,
+                        chunk_metadata,
+                    )
 
         if use_parallel_tokenization:
             while pending_futures:
@@ -1075,11 +1483,122 @@ def process_and_tokenize(
             except Exception:
                 pass
         if executor is not None:
-            for future in pending_futures:
+            for future, _, _, _ in pending_futures:
                 future.cancel()
             executor.shutdown(wait=True, cancel_futures=True)
         stats["dedup_rejects"] = dedup_rejects
         stats["unk_rejects"] = unk_rejects
+
+
+def preparation_recipe_sha256(
+    *,
+    filter_cfg: FilterConfig,
+    tokenizer_sha256: str,
+    c4_weight: float,
+    wiki_weight: float,
+    fineweb_weight: float,
+    shuffle_buffer: int,
+    seed: int,
+    max_unk_ratio: float,
+    validation_fraction: float,
+    canonical_manifest_sha256: str | None = None,
+    writing_weight: float = 0.0,
+) -> str:
+    """Fingerprint deterministic preparation inputs shared by both splits."""
+    payload = {
+        "schema_version": 1,
+        "tokenizer_sha256": tokenizer_sha256,
+        "source_weights": {
+            "c4": float(c4_weight),
+            "wiki": float(wiki_weight),
+            "fineweb": float(fineweb_weight),
+        },
+        "shuffle_buffer": int(shuffle_buffer),
+        "seed": int(seed),
+        "max_unk_ratio": float(max_unk_ratio),
+        "validation_fraction": float(validation_fraction),
+        "canonical_manifest_sha256": canonical_manifest_sha256,
+        "writing_weight": float(writing_weight),
+        "filter_config": asdict(filter_cfg),
+    }
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def indexed_source_records(
+    c4_weight: float,
+    wiki_weight: float,
+    fineweb_weight: float,
+) -> List[Source]:
+    """Describe enabled upstream sources without overstating text licensing."""
+    candidates = (
+        (
+            c4_weight,
+            Source(
+                "c4",
+                "AllenAI C4 English",
+                metadata={
+                    "dataset": "allenai/c4",
+                    "config": "en",
+                    "license_note": "Record-level rights may vary; review upstream terms.",
+                },
+            ),
+        ),
+        (
+            wiki_weight,
+            Source(
+                "wiki",
+                "English Wikipedia 2023-11-01",
+                metadata={
+                    "dataset": "wikimedia/wikipedia",
+                    "config": "20231101.en",
+                    "license_note": "Wikipedia content attribution and share-alike terms apply.",
+                },
+            ),
+        ),
+        (
+            fineweb_weight,
+            Source(
+                "fineweb",
+                "FineWeb-Edu",
+                metadata={
+                    "dataset": os.environ.get(
+                        "FINEWEB_REPO",
+                        "HuggingFaceFW/fineweb-edu",
+                    ),
+                    "config": os.environ.get("FINEWEB_CONFIG", "sample-10BT"),
+                    "license_note": "Record-level rights may vary; review upstream terms.",
+                },
+            ),
+        ),
+    )
+    return [source for weight, source in candidates if weight > 0]
+
+
+def canonical_source_records(manifest_path: str | None) -> List[Source]:
+    if not manifest_path:
+        return []
+    manifest = _load_json_manifest(manifest_path)
+    records = []
+    for source_id, source in sorted((manifest.get("sources") or {}).items()):
+        records.append(
+            Source(
+                source_id,
+                source.get("name") or source_id,
+                source.get("license"),
+                metadata={
+                    "roles": source.get("roles") or [],
+                    "canonical_manifest": os.path.abspath(manifest_path),
+                    "selection_policy": manifest.get("selection_policy"),
+                },
+            )
+        )
+    return records
 
 
 def main():
@@ -1108,11 +1627,34 @@ Examples:
     # Data parameters
     parser.add_argument("--tokenizer_model", default=None, help="SentencePiece model")
     parser.add_argument("--out_dir", default=None, help="Output directory")
+    parser.add_argument(
+        "--output_format",
+        choices=("flat", "indexed"),
+        default=None,
+        help="Output flat .bin files or immutable indexed corpora.",
+    )
     parser.add_argument("--train_tokens", type=int, default=None, help="Target train tokens")
     parser.add_argument("--val_tokens", type=int, default=None, help="Target val tokens")
+    parser.add_argument(
+        "--validation_fraction",
+        type=float,
+        default=None,
+        help="Deterministic raw-document fraction reserved for validation.",
+    )
     parser.add_argument("--c4_weight", type=float, default=None, help="C4 sampling weight")
     parser.add_argument("--wiki_weight", type=float, default=None, help="Wikipedia sampling weight")
     parser.add_argument("--fineweb_weight", type=float, default=None, help="FineWeb sampling weight")
+    parser.add_argument(
+        "--canonical_manifest",
+        default=None,
+        help="Verified canonical-writing manifest.",
+    )
+    parser.add_argument(
+        "--writing_weight",
+        type=float,
+        default=None,
+        help="Sampling weight for the canonical writing lane.",
+    )
     parser.add_argument(
         "--gutenberg_weight",
         type=float,
@@ -1158,8 +1700,23 @@ Examples:
     # Resolve parameters
     tokenizer_model = args.tokenizer_model or data_prep_cfg.get("tokenizer_model", "tokenizer/spm.model")
     out_dir = args.out_dir or data_prep_cfg.get("out_dir", "data")
+    output_format = args.output_format or data_prep_cfg.get("output_format", "flat")
+    if output_format not in {"flat", "indexed"}:
+        raise SystemExit("data_prep.output_format must be one of: flat, indexed")
     train_tokens = args.train_tokens or data_prep_cfg.get("train_tokens", 2_000_000_000)
     val_tokens = args.val_tokens or data_prep_cfg.get("val_tokens", 20_000_000)
+    default_validation_fraction = val_tokens / max(1, train_tokens + val_tokens)
+    validation_fraction = (
+        args.validation_fraction
+        if args.validation_fraction is not None
+        else data_prep_cfg.get(
+            "validation_fraction",
+            default_validation_fraction,
+        )
+    )
+    validation_fraction = float(validation_fraction)
+    if not 0.0 < validation_fraction < 1.0:
+        raise SystemExit("validation_fraction must be between 0 and 1")
     c4_weight = args.c4_weight if args.c4_weight is not None else data_prep_cfg.get("c4_weight", 0.30)
     wiki_weight = args.wiki_weight if args.wiki_weight is not None else data_prep_cfg.get("wiki_weight", 0.45)
     fineweb_weight = (
@@ -1175,9 +1732,34 @@ Examples:
             print("[data] --gutenberg_weight is deprecated; treating it as --fineweb_weight.")
     elif args.gutenberg_weight is not None:
         print("[data] --gutenberg_weight ignored because --fineweb_weight is set.")
+    canonical_cfg = data_prep_cfg.get("canonical_writing", {}) or {}
+    canonical_manifest_path = (
+        args.canonical_manifest
+        if args.canonical_manifest is not None
+        else canonical_cfg.get("manifest")
+    )
+    writing_weight = (
+        args.writing_weight
+        if args.writing_weight is not None
+        else canonical_cfg.get("weight", 0.0)
+    )
+    writing_weight = float(writing_weight or 0.0)
+    if writing_weight > 0 and not canonical_manifest_path:
+        raise SystemExit(
+            "canonical_writing.manifest is required when writing weight is positive"
+        )
+    if canonical_manifest_path and not os.path.exists(canonical_manifest_path):
+        raise SystemExit(
+            f"Canonical writing manifest not found: {canonical_manifest_path}"
+        )
 
-    if c4_weight <= 0 and wiki_weight <= 0 and fineweb_weight <= 0:
-        raise SystemExit("At least one of c4_weight, wiki_weight, or fineweb_weight must be > 0.")
+    if (
+        c4_weight <= 0
+        and wiki_weight <= 0
+        and fineweb_weight <= 0
+        and writing_weight <= 0
+    ):
+        raise SystemExit("At least one source sampling weight must be > 0.")
     shuffle_buffer = args.shuffle_buffer or data_prep_cfg.get("shuffle_buffer", 50000)
     seed = args.seed if args.seed is not None else data_prep_cfg.get("seed", 1337)
     log_interval = args.log_interval or data_prep_cfg.get("log_interval", 30)
@@ -1198,10 +1780,19 @@ Examples:
     tokenizer_prefetch = max(1, int(tokenizer_prefetch))
 
     filter_cfg = FilterConfig.from_dict(data_prep_cfg)
+    target_shard_tokens = int(
+        data_prep_cfg.get("target_shard_tokens", 10_000_000)
+    )
+    if target_shard_tokens <= 0:
+        raise SystemExit("data_prep.target_shard_tokens must be positive")
 
     # Paths
     train_path = os.path.join(out_dir, "train.bin")
     val_path = os.path.join(out_dir, "val.bin")
+    indexed_train_dir = os.path.join(out_dir, "train")
+    indexed_val_dir = os.path.join(out_dir, "validation")
+    indexed_train_staging = indexed_train_dir + ".staging"
+    indexed_val_staging = indexed_val_dir + ".staging"
     meta_path = os.path.join(out_dir, "data_meta.json")
     checkpoint_path = os.path.join(out_dir, "checkpoint.json")
     log_dir = os.path.join(out_dir, "logs")
@@ -1224,9 +1815,28 @@ Examples:
 
         # Check output files
         if not args.overwrite and not args.resume:
-            if os.path.exists(train_path) or os.path.exists(val_path):
+            if output_format == "flat" and (
+                os.path.exists(train_path) or os.path.exists(val_path)
+            ):
                 print(f"Output files already exist in {out_dir}. Use --overwrite to replace or --resume to continue.")
                 sys.exit(1)
+            if output_format == "indexed" and (
+                os.path.exists(indexed_train_dir)
+                or os.path.exists(indexed_val_dir)
+            ):
+                raise SystemExit(
+                    f"Indexed output already exists in {out_dir}. "
+                    "Use --overwrite to replace both immutable splits."
+                )
+        if output_format == "indexed" and args.overwrite:
+            for corpus_dir in (
+                indexed_train_dir,
+                indexed_val_dir,
+                indexed_train_staging,
+                indexed_val_staging,
+            ):
+                if os.path.isdir(corpus_dir):
+                    shutil.rmtree(corpus_dir)
 
         # Load tokenizer
         print(f"Loading tokenizer from {tokenizer_model}")
@@ -1245,15 +1855,72 @@ Examples:
             "pad": sp.pad_id(),
         }
         tokenizer_sha256 = file_sha256(tokenizer_model)
+        recipe_sha256 = preparation_recipe_sha256(
+            filter_cfg=filter_cfg,
+            tokenizer_sha256=tokenizer_sha256,
+            c4_weight=c4_weight,
+            wiki_weight=wiki_weight,
+            fineweb_weight=fineweb_weight,
+            shuffle_buffer=shuffle_buffer,
+            seed=seed,
+            max_unk_ratio=0.01,
+            validation_fraction=validation_fraction,
+            canonical_manifest_sha256=(
+                file_sha256(canonical_manifest_path)
+                if canonical_manifest_path
+                else None
+            ),
+            writing_weight=writing_weight,
+        )
+        source_records = indexed_source_records(
+            c4_weight,
+            wiki_weight,
+            fineweb_weight,
+        )
+        source_records.extend(
+            canonical_source_records(canonical_manifest_path)
+        )
 
         dtype = np.uint16 if vocab_size < 65536 else np.uint32
         print(f"Vocab size: {vocab_size}, dtype: {dtype}")
 
         existing_train_tokens = 0
         existing_val_tokens = 0
+        train_final_exists = False
+        val_final_exists = False
+        train_staging_exists = False
+        val_staging_exists = False
+        if args.resume and output_format == "flat":
+            verify_flat_resume_provenance(
+                out_dir,
+                [train_path, val_path],
+                tokenizer_sha256,
+                checkpoint,
+            )
+            existing_train_tokens = count_tokens_in_file(
+                train_path, dtype, cap_at=train_tokens
+            )
+            existing_val_tokens = count_tokens_in_file(
+                val_path, dtype, cap_at=val_tokens
+            )
+        elif args.resume and output_format == "indexed":
+            train_final_exists = os.path.isdir(indexed_train_dir)
+            val_final_exists = os.path.isdir(indexed_val_dir)
+            train_staging_exists = os.path.isdir(indexed_train_staging)
+            val_staging_exists = os.path.isdir(indexed_val_staging)
+            if train_final_exists and train_staging_exists:
+                raise SystemExit("Both final and staging train corpora exist.")
+            if val_final_exists and val_staging_exists:
+                raise SystemExit("Both final and staging validation corpora exist.")
+            existing_train_tokens = indexed_manifest_tokens(
+                indexed_train_dir
+                if train_final_exists
+                else indexed_train_staging
+            )
+            existing_val_tokens = indexed_manifest_tokens(
+                indexed_val_dir if val_final_exists else indexed_val_staging
+            )
         if args.resume:
-            existing_train_tokens = count_tokens_in_file(train_path, dtype, cap_at=train_tokens)
-            existing_val_tokens = count_tokens_in_file(val_path, dtype, cap_at=val_tokens)
             print(
                 f"[resume] Existing files: train={existing_train_tokens:,}/{train_tokens:,} "
                 f"val={existing_val_tokens:,}/{val_tokens:,}",
@@ -1265,13 +1932,21 @@ Examples:
         print(f"  C4 weight: {c4_weight}")
         print(f"  Wikipedia weight: {wiki_weight}")
         print(f"  FineWeb weight: {fineweb_weight}")
+        print(f"  Canonical writing weight: {writing_weight}")
+        if canonical_manifest_path:
+            print(f"  Canonical manifest: {canonical_manifest_path}")
+        print(f"  Output format: {output_format}")
         print(f"  Train tokens: {train_tokens:,}")
         print(f"  Val tokens: {val_tokens:,}")
+        print(f"  Validation fraction: {validation_fraction:.4%}")
         print(f"  Shuffle buffer: {shuffle_buffer:,}")
         print(f"  Seed: {seed}")
         print(f"  Dedup enabled: {filter_cfg.dedup_enabled}")
         print(f"  Tokenizer workers: {tokenizer_workers}")
         print(f"  Tokenizer prefetch: {tokenizer_prefetch}")
+        if output_format == "indexed":
+            print(f"  Target shard tokens: {target_shard_tokens:,}")
+            print(f"  Recipe sha256: {recipe_sha256}")
         print()
 
         # Initialize deduplicator
@@ -1289,8 +1964,37 @@ Examples:
             "fineweb": FilterStats(),
             "dedup_rejects": 0,
         }
+        for source in canonical_source_records(canonical_manifest_path):
+            stats.setdefault(source.source_id, FilterStats())
+
+        def build_interleaved_source(split_seed):
+            def wrap(source_id, iterator):
+                for text in iterator:
+                    yield source_id, text, {}
+
+            lanes = {
+                "c4": (wrap("c4", stream_c4(split_seed)), c4_weight),
+                "wiki": (
+                    wrap("wiki", stream_wikipedia(split_seed)),
+                    wiki_weight,
+                ),
+                "fineweb": (
+                    wrap("fineweb", stream_fineweb(split_seed)),
+                    fineweb_weight,
+                ),
+            }
+            if canonical_manifest_path and writing_weight > 0:
+                lanes["canonical_writing"] = (
+                    iter_canonical_manifest(
+                        Path(canonical_manifest_path)
+                    ),
+                    writing_weight,
+                )
+            return interleave_named_sources(lanes, seed=split_seed)
 
         # Set up interrupt handler
+        train_corpus_sha256 = None
+        val_corpus_sha256 = None
         with GracefulInterrupt() as interrupt_handler:
             overall_start = time.time()
 
@@ -1303,27 +2007,21 @@ Examples:
 
             train_start = time.time()
             train_resume_tokens = existing_train_tokens if args.resume else 0
-            if train_resume_tokens >= train_tokens:
+            if train_final_exists or train_resume_tokens >= train_tokens:
                 print(
                     f"[resume] Training data already complete "
                     f"({train_resume_tokens:,}/{train_tokens:,} tokens). Skipping.",
                     flush=True,
                 )
-                actual_train_tokens = train_tokens
+                actual_train_tokens = train_resume_tokens
                 was_interrupted = False
             else:
-                c4_iter = stream_c4(seed)
-                wiki_iter = stream_wikipedia(seed)
-                fineweb_iter = stream_fineweb(seed) if fineweb_weight > 0 else iter(())
-
-                source_iter = interleave_sources(
-                    c4_iter,
-                    wiki_iter,
-                    fineweb_iter,
-                    c4_weight,
-                    wiki_weight,
-                    fineweb_weight,
-                    seed,
+                source_iter = build_interleaved_source(seed)
+                source_iter = partition_documents(
+                    source_iter,
+                    split="train",
+                    validation_fraction=validation_fraction,
+                    seed=seed,
                 )
 
                 tokens_iter = process_and_tokenize(
@@ -1339,20 +2037,41 @@ Examples:
                     tokenizer_model_path=tokenizer_model,
                 )
 
-                actual_train_tokens, was_interrupted = write_tokens_to_memmap(
-                    tokens_iter,
-                    train_path,
-                    train_tokens,
-                    dtype,
-                    eos_token_id,
-                    checkpoint_path,
-                    args.checkpoint_interval,
-                    log_interval,
-                    stats,
-                    interrupt_handler,
-                    phase="train",
-                    resume_existing_tokens=train_resume_tokens,
-                )
+                if output_format == "indexed":
+                    actual_train_tokens, was_interrupted, train_corpus_sha256 = (
+                        write_documents_to_indexed(
+                            tokens_iter,
+                            indexed_train_dir,
+                            train_tokens,
+                            np.dtype(dtype).name,
+                            eos_token_id,
+                            tokenizer_sha256,
+                            recipe_sha256,
+                            source_records,
+                            target_shard_tokens,
+                            checkpoint_interval=args.checkpoint_interval,
+                            log_interval=log_interval,
+                            interrupt_handler=interrupt_handler,
+                            split="train",
+                            resume=train_staging_exists,
+                        )
+                    )
+                else:
+                    actual_train_tokens, was_interrupted = write_tokens_to_memmap(
+                        tokens_iter,
+                        train_path,
+                        train_tokens,
+                        dtype,
+                        eos_token_id,
+                        checkpoint_path,
+                        args.checkpoint_interval,
+                        log_interval,
+                        stats,
+                        interrupt_handler,
+                        phase="train",
+                        resume_existing_tokens=train_resume_tokens,
+                        tokenizer_sha256=tokenizer_sha256,
+                    )
 
             train_elapsed = time.time() - train_start
             print(f"\nTraining data complete: {actual_train_tokens:,} tokens in {train_elapsed/60:.1f} minutes")
@@ -1360,16 +2079,23 @@ Examples:
             # Print filter statistics
             print("\nTraining filter statistics:")
             print("-" * 40)
-            print("C4:")
-            print(stats["c4"].report())
-            print("\nWikipedia:")
-            print(stats["wiki"].report())
-            print("\nFineWeb:")
-            print(stats["fineweb"].report())
+            for source_id, source_stats in stats.items():
+                if isinstance(source_stats, FilterStats):
+                    print(f"\n{source_id}:")
+                    print(source_stats.report())
             print(f"\nDeduplication rejects: {stats['dedup_rejects']:,}")
 
             if was_interrupted:
-                print("\n[!] Training interrupted. Checkpoint saved. Use --resume to continue.")
+                if output_format == "indexed":
+                    print(
+                        "\n[!] Indexed training build interrupted. Committed "
+                        "staging is valid; restart with --resume."
+                    )
+                else:
+                    print(
+                        "\n[!] Training interrupted. Checkpoint saved. "
+                        "Use --resume to continue."
+                    )
                 return
 
             # =====================================================================
@@ -1388,28 +2114,24 @@ Examples:
                 "fineweb": FilterStats(),
                 "dedup_rejects": 0,
             }
-            if val_resume_tokens >= val_tokens:
+            for source in canonical_source_records(canonical_manifest_path):
+                val_stats.setdefault(source.source_id, FilterStats())
+            if val_final_exists or val_resume_tokens >= val_tokens:
                 print(
                     f"[resume] Validation data already complete "
                     f"({val_resume_tokens:,}/{val_tokens:,} tokens). Skipping.",
                     flush=True,
                 )
-                actual_val_tokens = val_tokens
+                actual_val_tokens = val_resume_tokens
                 was_interrupted = False
             else:
                 val_seed = seed + 999
-                c4_iter = stream_c4(val_seed)
-                wiki_iter = stream_wikipedia(val_seed)
-                fineweb_iter = stream_fineweb(val_seed) if fineweb_weight > 0 else iter(())
-
-                source_iter = interleave_sources(
-                    c4_iter,
-                    wiki_iter,
-                    fineweb_iter,
-                    c4_weight,
-                    wiki_weight,
-                    fineweb_weight,
-                    val_seed,
+                source_iter = build_interleaved_source(val_seed)
+                source_iter = partition_documents(
+                    source_iter,
+                    split="validation",
+                    validation_fraction=validation_fraction,
+                    seed=seed,
                 )
 
                 val_deduplicator = None
@@ -1432,31 +2154,62 @@ Examples:
                     tokenizer_model_path=tokenizer_model,
                 )
 
-                actual_val_tokens, was_interrupted = write_tokens_to_memmap(
-                    tokens_iter,
-                    val_path,
-                    val_tokens,
-                    dtype,
-                    eos_token_id,
-                    checkpoint_path,
-                    args.checkpoint_interval,
-                    log_interval,
-                    val_stats,
-                    interrupt_handler,
-                    phase="val",
-                    resume_existing_tokens=val_resume_tokens,
-                )
+                if output_format == "indexed":
+                    actual_val_tokens, was_interrupted, val_corpus_sha256 = (
+                        write_documents_to_indexed(
+                            tokens_iter,
+                            indexed_val_dir,
+                            val_tokens,
+                            np.dtype(dtype).name,
+                            eos_token_id,
+                            tokenizer_sha256,
+                            recipe_sha256,
+                            source_records,
+                            target_shard_tokens,
+                            checkpoint_interval=args.checkpoint_interval,
+                            log_interval=log_interval,
+                            interrupt_handler=interrupt_handler,
+                            split="validation",
+                            resume=val_staging_exists,
+                        )
+                    )
+                else:
+                    actual_val_tokens, was_interrupted = write_tokens_to_memmap(
+                        tokens_iter,
+                        val_path,
+                        val_tokens,
+                        dtype,
+                        eos_token_id,
+                        checkpoint_path,
+                        args.checkpoint_interval,
+                        log_interval,
+                        val_stats,
+                        interrupt_handler,
+                        phase="val",
+                        resume_existing_tokens=val_resume_tokens,
+                        tokenizer_sha256=tokenizer_sha256,
+                    )
 
             val_elapsed = time.time() - val_start
             print(f"\nValidation data complete: {actual_val_tokens:,} tokens in {val_elapsed/60:.1f} minutes")
             if was_interrupted:
-                print("\n[!] Validation interrupted. Checkpoint saved. Use --resume to continue.")
+                if output_format == "indexed":
+                    print(
+                        "\n[!] Indexed validation build interrupted. Committed "
+                        "staging is valid; restart with --resume."
+                    )
+                else:
+                    print(
+                        "\n[!] Validation interrupted. Checkpoint saved. "
+                        "Use --resume to continue."
+                    )
                 return
 
         # =====================================================================
         # Save metadata
         # =====================================================================
         meta = {
+            "output_format": output_format,
             "train_tokens": actual_train_tokens,
             "val_tokens": actual_val_tokens,
             "vocab_size": vocab_size,
@@ -1465,6 +2218,13 @@ Examples:
             "c4_weight": c4_weight,
             "wiki_weight": wiki_weight,
             "fineweb_weight": fineweb_weight,
+            "writing_weight": writing_weight,
+            "canonical_manifest": (
+                os.path.abspath(canonical_manifest_path)
+                if canonical_manifest_path
+                else None
+            ),
+            "validation_fraction": validation_fraction,
             # Backward-compatible alias.
             "gutenberg_weight": fineweb_weight,
             "seed": seed,
@@ -1474,6 +2234,24 @@ Examples:
             "tokenizer_sha256": tokenizer_sha256,
             "tokenizer_vocab_size": vocab_size,
             "tokenizer_special_ids": tokenizer_special_ids,
+            "preparation_recipe_sha256": recipe_sha256,
+            "indexed": {
+                "train_dir": (
+                    os.path.abspath(indexed_train_dir)
+                    if output_format == "indexed"
+                    else None
+                ),
+                "validation_dir": (
+                    os.path.abspath(indexed_val_dir)
+                    if output_format == "indexed"
+                    else None
+                ),
+                "train_corpus_sha256": train_corpus_sha256,
+                "validation_corpus_sha256": val_corpus_sha256,
+                "target_shard_tokens": (
+                    target_shard_tokens if output_format == "indexed" else None
+                ),
+            },
             "filter_config": {
                 "min_chars": filter_cfg.min_chars,
                 "max_chars": filter_cfg.max_chars,
@@ -1496,8 +2274,16 @@ Examples:
                 "gutenberg_total": stats["fineweb"].total_docs,
                 "gutenberg_passed": stats["fineweb"].passed_docs,
                 "dedup_rejects": stats["dedup_rejects"],
+                "by_source": {
+                    source_id: {
+                        "total": source_stats.total_docs,
+                        "passed": source_stats.passed_docs,
+                    }
+                    for source_id, source_stats in stats.items()
+                    if isinstance(source_stats, FilterStats)
+                },
             },
-            "created_at": datetime.utcnow().isoformat() + "Z",
+            "created_at": datetime.now(timezone.utc).isoformat(),
         }
 
         with open(meta_path, "w", encoding="utf-8") as f:
@@ -1512,8 +2298,12 @@ Examples:
         total_elapsed = time.time() - overall_start
         print(f"\nTotal time: {total_elapsed/60:.1f} minutes")
         print(f"Output files:")
-        print(f"  {train_path} ({actual_train_tokens:,} tokens)")
-        print(f"  {val_path} ({actual_val_tokens:,} tokens)")
+        if output_format == "indexed":
+            print(f"  {indexed_train_dir} ({actual_train_tokens:,} tokens)")
+            print(f"  {indexed_val_dir} ({actual_val_tokens:,} tokens)")
+        else:
+            print(f"  {train_path} ({actual_train_tokens:,} tokens)")
+            print(f"  {val_path} ({actual_val_tokens:,} tokens)")
         print(f"  {meta_path}")
 
     finally:

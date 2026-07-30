@@ -1,0 +1,382 @@
+version: 1
+updated_utc: "2026-07-27"
+
+policy:
+  registry_scope: unlimited
+  max_active_inspection_sources: 25
+  generated_data_root: data/source_samples
+  statuses:
+    - candidate
+    - quarantined
+    - inspecting
+    - accepted
+    - rejected
+  redistribution:
+    - redistributable
+    - train_only
+    - permission_required
+    - excluded
+  review:
+    quick_documents: 12
+    deep_documents_boutique: 40
+    deep_documents_trunk: 100
+    artifact_clean_min_fraction: 0.80
+    quality_pass_min_fraction: 0.70
+    synthetic_suspicion_max_fraction: 0.05
+    max_repetitions: 4
+    boutique_max_anneal_fraction: 0.10
+    author_max_boutique_source_fraction: 0.20
+    rationalist_cluster_max_boutique_fraction: 0.25
+
+sources:
+  gwern:
+    name: Gwern.net essays
+    tier: A
+    status: inspecting
+    redistribution: redistributable
+    license: CC0-1.0
+    license_url: https://gwern.net/about#license
+    homepage: https://gwern.net/
+    roles: [analytical_essay, technical_explanation, long_form]
+    acquisition:
+      enabled: true
+      kind: sitemap_html
+      sitemap_url: https://gwern.net/sitemap.xml
+      robots_url: https://gwern.net/robots.txt
+      include_prefix: https://gwern.net/
+      exclude_substrings: [/doc/, /newsletter/, /changelog, /index, /about]
+
+  standard_ebooks:
+    name: Standard Ebooks
+    tier: A
+    status: inspecting
+    redistribution: redistributable
+    license: CC0-1.0
+    license_url: https://standardebooks.org/about/standard-ebooks-and-the-public-domain
+    homepage: https://standardebooks.org/
+    roles: [literature, long_form, edited_book]
+    acquisition:
+      enabled: true
+      kind: github_org_epubs
+      organization: standardebooks
+      api_url: https://api.github.com/orgs/standardebooks/repos
+
+  public_domain_review:
+    name: Public Domain Review essays
+    tier: A
+    status: inspecting
+    redistribution: redistributable
+    license: CC-BY-SA-4.0
+    license_url: https://publicdomainreview.org/about/
+    homepage: https://publicdomainreview.org/
+    roles: [edited_essay, cultural_history, narrative_explanation]
+    notes: Exclude embedded book excerpts whose terms differ from the article.
+    acquisition:
+      enabled: true
+      kind: huggingface
+      dataset_id: common-pile/public_domain_review
+      split: train
+      text_fields: [text]
+
+  our_world_in_data:
+    name: Our World in Data articles
+    tier: A
+    status: inspecting
+    redistribution: redistributable
+    license: CC-BY-4.0
+    license_url: https://ourworldindata.org/faqs
+    homepage: https://ourworldindata.org/
+    roles: [data_explanation, factual_exposition, edited_article]
+    notes: Exclude third-party passages, charts, and data with separate terms.
+    acquisition:
+      enabled: true
+      kind: sitemap_html
+      sitemap_url: https://ourworldindata.org/sitemap.xml
+      robots_url: https://ourworldindata.org/robots.txt
+      include_prefix: https://ourworldindata.org/
+      exclude_substrings: [/grapher/, /explorers/, /search, /subscribe, /about, /team]
+
+  crs_reports:
+    name: Congressional Research Service reports
+    tier: A
+    status: inspecting
+    redistribution: redistributable
+    license: US-Public-Domain
+    license_url: https://www.everycrsreport.com/download.html
+    homepage: https://www.everycrsreport.com/
+    roles: [policy_analysis, factual_exposition, professional_report]
+    notes: Remove or separately review incorporated third-party copyrighted material.
+    acquisition:
+      enabled: true
+      kind: crs_csv
+      index_url: https://www.everycrsreport.com/reports.csv
+      base_url: https://www.everycrsreport.com/
+
+  plos:
+    name: PLOS research articles
+    tier: A
+    status: inspecting
+    redistribution: redistributable
+    license: CC-BY-4.0
+    license_url: https://plos.org/terms-of-use/
+    homepage: https://plos.org/
+    roles: [academic_prose, scientific_explanation, evidence_reporting]
+    acquisition:
+      enabled: true
+      kind: plos_api
+      api_url: https://api.plos.org/search
+
+  common_pile_doab:
+    name: Common Pile DOAB open-access books
+    tier: A
+    status: inspecting
+    redistribution: redistributable
+    license: per-document-open-license
+    license_url: https://huggingface.co/datasets/common-pile/doab
+    homepage: https://www.doabooks.org/
+    roles: [modern_book, academic_monograph, long_form]
+    acquisition:
+      enabled: true
+      kind: huggingface
+      dataset_id: common-pile/doab
+      split: train
+      text_fields: [text]
+
+  common_pile_gutenberg:
+    name: Common Pile Project Gutenberg
+    tier: A
+    status: inspecting
+    redistribution: redistributable
+    license: public-domain-filtered
+    license_url: https://huggingface.co/datasets/common-pile/project_gutenberg
+    homepage: https://www.gutenberg.org/
+    roles: [literature, public_domain_book, long_form]
+    acquisition:
+      enabled: true
+      kind: huggingface
+      dataset_id: common-pile/project_gutenberg
+      split: train
+      text_fields: [text]
+
+  common_pile_wikimedia:
+    name: Common Pile filtered Wikimedia
+    tier: A
+    status: inspecting
+    redistribution: redistributable
+    license: per-document-wikimedia-license
+    license_url: https://huggingface.co/datasets/common-pile/wikimedia_filtered
+    homepage: https://www.wikimedia.org/
+    roles: [reference, factual_exposition]
+    acquisition:
+      enabled: true
+      kind: huggingface
+      dataset_id: common-pile/wikimedia_filtered
+      split: train
+      text_fields: [text]
+
+  common_pile_pes2o:
+    name: Common Pile open-license peS2o
+    tier: A
+    status: inspecting
+    redistribution: redistributable
+    license: per-document-open-license
+    license_url: https://huggingface.co/datasets/common-pile/peS2o
+    homepage: https://allenai.org/data/pes2o
+    roles: [academic_prose, scientific_explanation]
+    acquisition:
+      enabled: true
+      kind: huggingface
+      dataset_id: common-pile/peS2o
+      split: train
+      text_fields: [text]
+
+  common_pile_stackexchange:
+    name: Common Pile Stack Exchange
+    tier: A
+    status: inspecting
+    redistribution: redistributable
+    license: per-document-CC-BY-SA
+    license_url: https://huggingface.co/datasets/common-pile/stackexchange
+    homepage: https://stackexchange.com/
+    roles: [expert_discussion, problem_solving, technical_explanation]
+    notes: Use the packaged December 2024 Common Pile snapshot, not live crawling.
+    acquisition:
+      enabled: true
+      kind: huggingface
+      dataset_id: common-pile/stackexchange
+      split: train
+      text_fields: [text]
+
+  libretexts:
+    name: LibreTexts open textbooks
+    tier: A
+    status: candidate
+    redistribution: redistributable
+    license: per-document-open-license
+    license_url: https://huggingface.co/datasets/common-pile/libretexts
+    homepage: https://libretexts.org/
+    roles: [textbook, educational_exposition]
+    acquisition: {enabled: false, kind: huggingface, dataset_id: common-pile/libretexts, split: train, text_fields: [text]}
+
+  pressbooks:
+    name: Pressbooks open-access books
+    tier: A
+    status: candidate
+    redistribution: redistributable
+    license: per-document-open-license
+    license_url: https://huggingface.co/datasets/common-pile/pressbooks
+    homepage: https://pressbooks.com/
+    roles: [textbook, modern_book, educational_exposition]
+    acquisition: {enabled: false, kind: huggingface, dataset_id: common-pile/pressbooks, split: train, text_fields: [text]}
+
+  kl3m:
+    name: KL3M verified government, legal, and financial documents
+    tier: A
+    status: candidate
+    redistribution: redistributable
+    license: CC-BY-4.0
+    homepage: https://huggingface.co/alea-institute
+    roles: [legal_writing, government_writing, financial_writing]
+    acquisition: {enabled: false, kind: manual}
+
+  hacker_news:
+    name: Historical Hacker News discussions
+    tier: A
+    status: candidate
+    redistribution: redistributable
+    license: dataset-specific-review-required
+    homepage: https://news.ycombinator.com/
+    roles: [technical_discussion, informal_explanation]
+    acquisition: {enabled: false, kind: manual}
+
+  lesswrong:
+    name: LessWrong
+    tier: B
+    status: quarantined
+    redistribution: train_only
+    license: author-retained
+    homepage: https://www.lesswrong.com/
+    roles: [analytical_essay, rationalist_discourse]
+    notes: Use only through the official API with source and author metadata; do not trust third-party scrape licenses.
+    acquisition: {enabled: false, kind: official_api}
+
+  slate_star_codex:
+    name: Slate Star Codex
+    tier: B
+    status: quarantined
+    redistribution: train_only
+    license: author-retained
+    homepage: https://slatestarcodex.com/
+    roles: [analytical_essay, review, long_form]
+    notes: Prefer an author-provided export and explicit permission.
+    acquisition: {enabled: false, kind: permission}
+
+  astral_codex_ten:
+    name: Astral Codex Ten
+    tier: C
+    status: quarantined
+    redistribution: permission_required
+    license: author-retained
+    homepage: https://www.astralcodexten.com/
+    roles: [analytical_essay, review, long_form]
+    notes: Substack terms prohibit bulk scraping and storage; require author-provided export or written permission.
+    acquisition: {enabled: false, kind: permission}
+
+  paul_graham:
+    name: Paul Graham essays
+    tier: C
+    status: quarantined
+    redistribution: permission_required
+    license: author-retained
+    homepage: https://paulgraham.com/articles.html
+    roles: [essay, startup_writing, technical_explanation]
+    acquisition: {enabled: false, kind: permission}
+
+  stanford_encyclopedia_philosophy:
+    name: Stanford Encyclopedia of Philosophy
+    tier: C
+    status: quarantined
+    redistribution: permission_required
+    license: restricted-bulk-reuse
+    homepage: https://plato.stanford.edu/
+    roles: [reference, philosophy, scholarly_exposition]
+    acquisition: {enabled: false, kind: permission}
+
+  quanta:
+    name: Quanta Magazine
+    tier: C
+    status: quarantined
+    redistribution: permission_required
+    license: publisher-retained
+    homepage: https://www.quantamagazine.org/
+    roles: [science_journalism, technical_explanation]
+    acquisition: {enabled: false, kind: permission}
+
+  asterisk:
+    name: Asterisk Magazine
+    tier: C
+    status: quarantined
+    redistribution: permission_required
+    license: publisher-retained
+    homepage: https://asteriskmag.com/
+    roles: [edited_essay, policy, science]
+    acquisition: {enabled: false, kind: permission}
+
+  works_in_progress:
+    name: Works in Progress
+    tier: C
+    status: quarantined
+    redistribution: permission_required
+    license: publisher-retained
+    homepage: https://worksinprogress.co/
+    roles: [edited_essay, history, technology]
+    acquisition: {enabled: false, kind: permission}
+
+  nautilus:
+    name: Nautilus
+    tier: C
+    status: quarantined
+    redistribution: permission_required
+    license: publisher-retained
+    homepage: https://nautil.us/
+    roles: [science_essay, narrative_explanation]
+    acquisition: {enabled: false, kind: permission}
+
+  marginal_revolution:
+    name: Marginal Revolution
+    tier: C
+    status: quarantined
+    redistribution: permission_required
+    license: author-retained
+    homepage: https://marginalrevolution.com/
+    roles: [economics, commentary, analytical_blog]
+    acquisition: {enabled: false, kind: permission}
+
+  aeon:
+    name: Aeon
+    tier: D
+    status: rejected
+    redistribution: excluded
+    license: explicit-crawler-block
+    homepage: https://aeon.co/
+    roles: [edited_essay]
+    acquisition: {enabled: false, kind: excluded}
+
+  reddit:
+    name: Reddit
+    tier: D
+    status: rejected
+    redistribution: excluded
+    license: explicit-crawler-block-and-commercial-api
+    homepage: https://www.reddit.com/
+    roles: [discussion]
+    acquisition: {enabled: false, kind: excluded}
+
+  books3_libgen:
+    name: Books3 and LibGen lineage
+    tier: D
+    status: rejected
+    redistribution: excluded
+    license: unauthorized-copy-lineage
+    roles: [book]
+    acquisition: {enabled: false, kind: excluded}

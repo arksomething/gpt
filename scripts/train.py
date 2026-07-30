@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -19,6 +20,13 @@ import sentencepiece as spm
 from accelerate import Accelerator
 from transformers import LlamaConfig, LlamaForCausalLM, get_cosine_schedule_with_warmup
 from huggingface_hub import HfApi, hf_hub_download, login as hf_login
+
+from scripts.indexed_shards import (
+    IndexedCorpusSampler,
+    IndexedShardReader,
+    ShardFormatError,
+)
+from scripts.run_observer import RunObserver, atomic_write_json
 
 
 def load_yaml(path):
@@ -45,6 +53,79 @@ def _load_json_if_exists(path):
             return json.load(f)
     except (OSError, json.JSONDecodeError):
         return None
+
+
+def _find_artifact_manifest_path(checkpoint_dir):
+    parent = os.path.dirname(os.path.normpath(checkpoint_dir))
+    candidates = [
+        os.path.join(checkpoint_dir, "artifacts_manifest.json"),
+        os.path.join(checkpoint_dir, "artifacts", "artifacts_manifest.json"),
+        os.path.join(parent, "artifacts_manifest.json"),
+        os.path.join(parent, "artifacts", "artifacts_manifest.json"),
+    ]
+    return next((path for path in candidates if os.path.exists(path)), None)
+
+
+def _load_initial_weights(
+    model,
+    checkpoint_dir,
+    *,
+    model_config_path,
+    tokenizer_path,
+):
+    """Load a base checkpoint for a new run and return immutable lineage."""
+
+    checkpoint_dir = os.path.abspath(checkpoint_dir)
+    model_path = os.path.join(checkpoint_dir, "model.pt")
+    if not os.path.exists(model_path):
+        raise SystemExit(
+            f"Initialization checkpoint has no model.pt: {checkpoint_dir}"
+        )
+    manifest_path = _find_artifact_manifest_path(checkpoint_dir)
+    if manifest_path is None:
+        raise SystemExit(
+            "Initialization checkpoint is missing artifacts_manifest.json; "
+            "refusing an untraceable post-training run."
+        )
+    manifest = _load_json_if_exists(manifest_path)
+    if not isinstance(manifest, dict):
+        raise SystemExit(f"Invalid initialization manifest: {manifest_path}")
+
+    errors = []
+    expected_model_sha = (manifest.get("model_config") or {}).get("sha256")
+    actual_model_sha = _file_sha256(model_config_path)
+    if expected_model_sha and expected_model_sha != actual_model_sha:
+        errors.append(
+            "model config hash mismatch: "
+            f"checkpoint={expected_model_sha}, current={actual_model_sha}"
+        )
+    expected_tokenizer_sha = (manifest.get("tokenizer") or {}).get("sha256")
+    actual_tokenizer_sha = (
+        _file_sha256(tokenizer_path)
+        if tokenizer_path and os.path.exists(tokenizer_path)
+        else None
+    )
+    if expected_tokenizer_sha and expected_tokenizer_sha != actual_tokenizer_sha:
+        errors.append(
+            "tokenizer hash mismatch: "
+            f"checkpoint={expected_tokenizer_sha}, current={actual_tokenizer_sha}"
+        )
+    if errors:
+        raise SystemExit(
+            "Initialization artifact validation failed.\n- " + "\n- ".join(errors)
+        )
+
+    state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
+    model.load_state_dict(state_dict, strict=True)
+    return {
+        "checkpoint_dir": checkpoint_dir,
+        "model_sha256": _file_sha256(model_path),
+        "artifacts_manifest_path": os.path.abspath(manifest_path),
+        "artifacts_manifest_sha256": _file_sha256(manifest_path),
+        "parent_compatibility_fingerprint": manifest.get(
+            "compatibility_fingerprint"
+        ),
+    }
 
 
 def _utc_now_iso():
@@ -90,6 +171,27 @@ def _find_data_meta_path(data_cfg):
     return os.path.join(os.path.dirname(train_bin) or ".", "data_meta.json")
 
 
+def _indexed_manifest_info(corpus_dir):
+    if not corpus_dir:
+        return None
+    manifest_path = os.path.join(corpus_dir, "manifest.json")
+    manifest = _load_json_if_exists(manifest_path)
+    return {
+        "corpus_dir": os.path.abspath(corpus_dir),
+        "manifest_path": (
+            os.path.abspath(manifest_path) if os.path.exists(manifest_path) else None
+        ),
+        "manifest_sha256": (
+            _file_sha256(manifest_path) if os.path.exists(manifest_path) else None
+        ),
+        "corpus_sha256": (manifest or {}).get("corpus_sha256"),
+        "tokenizer_sha256": (manifest or {}).get("tokenizer_sha256"),
+        "recipe_sha256": (manifest or {}).get("recipe_sha256"),
+        "document_count": (manifest or {}).get("document_count"),
+        "token_count": (manifest or {}).get("token_count"),
+    }
+
+
 def _build_artifact_manifest(model_config_path, train_config_path, model_cfg, train_cfg, data_cfg):
     tokenizer_path = _resolve_tokenizer_path(train_cfg)
     tokenizer_info = {
@@ -114,6 +216,7 @@ def _build_artifact_manifest(model_config_path, train_config_path, model_cfg, tr
 
     model_cfg_sha = _file_sha256(model_config_path) if os.path.exists(model_config_path) else None
     train_cfg_sha = _file_sha256(train_config_path) if os.path.exists(train_config_path) else None
+    indexed_cfg = data_cfg.get("indexed", {}) or {}
 
     return {
         "schema_version": 1,
@@ -137,8 +240,53 @@ def _build_artifact_manifest(model_config_path, train_config_path, model_cfg, tr
             "val_bin": data_cfg.get("val_bin"),
             "hf_repo": data_cfg.get("hf_repo"),
             "data_meta": data_meta_info,
+            "indexed": {
+                "enabled": bool(indexed_cfg.get("enabled", False)),
+                "train": _indexed_manifest_info(indexed_cfg.get("train_dir")),
+                "validation": _indexed_manifest_info(indexed_cfg.get("val_dir")),
+                "source_weights": indexed_cfg.get("source_weights"),
+                "validation_source_weights": indexed_cfg.get(
+                    "validation_source_weights"
+                ),
+            },
         },
     }
+
+
+def _training_compatibility_fingerprint(artifact_manifest):
+    """Hash only immutable inputs that must agree for an exact resume."""
+    data = artifact_manifest.get("data") or {}
+    indexed = data.get("indexed") or {}
+    payload = {
+        "model_config_sha256": (
+            artifact_manifest.get("model_config") or {}
+        ).get("sha256"),
+        "train_config_sha256": (
+            artifact_manifest.get("train_config") or {}
+        ).get("sha256"),
+        "tokenizer_sha256": (
+            artifact_manifest.get("tokenizer") or {}
+        ).get("sha256"),
+        "flat_data_meta_sha256": (data.get("data_meta") or {}).get("sha256"),
+        "indexed_train_corpus_sha256": (
+            indexed.get("train") or {}
+        ).get("corpus_sha256"),
+        "indexed_validation_corpus_sha256": (
+            indexed.get("validation") or {}
+        ).get("corpus_sha256"),
+        "source_weights": indexed.get("source_weights"),
+        "validation_source_weights": indexed.get("validation_source_weights"),
+        "initialization_model_sha256": (
+            artifact_manifest.get("initialization") or {}
+        ).get("model_sha256"),
+    }
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _save_artifact_manifest(output_dir, artifact_manifest):
@@ -176,6 +324,14 @@ def _collect_artifact_upload_files(artifact_manifest, artifact_manifest_path, mo
     data_meta_path = (((artifact_manifest.get("data") or {}).get("data_meta") or {}).get("path"))
     if data_meta_path:
         _add(data_meta_path, "artifacts/data/data_meta.json")
+    indexed_info = (artifact_manifest.get("data") or {}).get("indexed") or {}
+    for split_name in ("train", "validation"):
+        manifest_path = (indexed_info.get(split_name) or {}).get("manifest_path")
+        if manifest_path:
+            _add(
+                manifest_path,
+                f"artifacts/data/{split_name}_indexed_manifest.json",
+            )
 
     return uploads
 
@@ -234,6 +390,35 @@ def _verify_tokenizer_compat(model_cfg, train_cfg, data_cfg):
             "Tokenizer/model config mismatch. Fix before training:\n"
             f"- {details}"
         )
+
+    indexed_cfg = data_cfg.get("indexed", {}) or {}
+    if indexed_cfg.get("enabled", False):
+        current_hash = _file_sha256(tokenizer_path)
+        configured_hash = indexed_cfg.get("tokenizer_sha256")
+        if configured_hash and configured_hash.lower() != current_hash:
+            raise SystemExit(
+                "Tokenizer/indexed-data config mismatch: "
+                f"configured sha256={configured_hash}, current tokenizer={current_hash}."
+            )
+        for split_name, corpus_dir in (
+            ("train", indexed_cfg.get("train_dir")),
+            ("validation", indexed_cfg.get("val_dir")),
+        ):
+            manifest_path = (
+                os.path.join(corpus_dir, "manifest.json") if corpus_dir else None
+            )
+            manifest = _load_json_if_exists(manifest_path)
+            if not manifest:
+                raise SystemExit(
+                    f"Indexed {split_name} manifest not found or invalid: {manifest_path}"
+                )
+            manifest_hash = manifest.get("tokenizer_sha256")
+            if manifest_hash != current_hash:
+                raise SystemExit(
+                    f"Tokenizer/indexed {split_name} mismatch: "
+                    f"manifest sha256={manifest_hash}, current tokenizer={current_hash}."
+                )
+        return
 
     train_bin = data_cfg.get("train_bin")
     if not train_bin:
@@ -648,6 +833,94 @@ def set_seed(seed):
     torch.cuda.manual_seed_all(seed)
 
 
+TRAINING_PROGRESS_SCHEMA_VERSION = 2
+
+
+def _training_progress_path(checkpoint_dir, process_index=0):
+    return os.path.join(
+        checkpoint_dir,
+        f"training_progress_rank_{int(process_index):05d}.json",
+    )
+
+
+def save_training_progress(
+    checkpoint_dir,
+    completed_steps,
+    batch_rng,
+    process_index=0,
+    compatibility_fingerprint=None,
+    counters=None,
+):
+    """Persist non-Accelerate state required to select the exact next batch."""
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    path = _training_progress_path(checkpoint_dir, process_index)
+    payload = {
+        "schema_version": TRAINING_PROGRESS_SCHEMA_VERSION,
+        "completed_steps": int(completed_steps),
+        "batch_rng_state": batch_rng.bit_generator.state,
+        "compatibility_fingerprint": compatibility_fingerprint,
+        "counters": dict(counters or {}),
+    }
+    temp_path = f"{path}.tmp"
+    with open(temp_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(temp_path, path)
+    return path
+
+
+def load_training_progress(
+    checkpoint_dir,
+    batch_rng,
+    process_index=0,
+    expected_compatibility_fingerprint=None,
+    counters=None,
+):
+    """Restore batch sampling state and return the number of completed steps."""
+    path = _training_progress_path(checkpoint_dir, process_index)
+    if not os.path.exists(path):
+        raise SystemExit(
+            "Checkpoint lacks exact-resume training progress: "
+            f"{path}. Older checkpoints may still load model weights, but cannot "
+            "guarantee the same next batch or schedule."
+        )
+    with open(path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+    if payload.get("schema_version") != TRAINING_PROGRESS_SCHEMA_VERSION:
+        raise SystemExit(
+            "Unsupported training-progress schema in "
+            f"{path}: {payload.get('schema_version')!r}"
+        )
+    completed_steps = payload.get("completed_steps")
+    rng_state = payload.get("batch_rng_state")
+    if not isinstance(completed_steps, int) or completed_steps < 0:
+        raise SystemExit(f"Invalid completed_steps in training progress: {path}")
+    if not isinstance(rng_state, dict):
+        raise SystemExit(f"Invalid batch_rng_state in training progress: {path}")
+    saved_fingerprint = payload.get("compatibility_fingerprint")
+    if expected_compatibility_fingerprint is not None:
+        if saved_fingerprint != expected_compatibility_fingerprint:
+            raise SystemExit(
+                "Checkpoint compatibility fingerprint mismatch. Refusing exact "
+                "resume because model, training config, tokenizer, data, or "
+                f"mixture inputs differ: {path}"
+            )
+    try:
+        batch_rng.bit_generator.state = rng_state
+    except (TypeError, ValueError) as exc:
+        raise SystemExit(
+            f"Incompatible batch RNG state in training progress: {path}: {exc}"
+        ) from exc
+    saved_counters = payload.get("counters") or {}
+    if not isinstance(saved_counters, dict):
+        raise SystemExit(f"Invalid counters in training progress: {path}")
+    if counters is not None:
+        counters.clear()
+        counters.update(saved_counters)
+    return completed_steps
+
+
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters())
 
@@ -894,8 +1167,107 @@ class StreamingDataLoader:
         self._prefetch_thread.join(timeout=2.0)
 
 
+class IndexedDataLoader:
+    """Stateless-on-RNG adapter from indexed corpora to model-ready tensors."""
+
+    def __init__(
+        self,
+        corpus_dir,
+        *,
+        batch_size,
+        block_size,
+        device,
+        source_weights=None,
+        expected_tokenizer_sha256=None,
+        expected_recipe_sha256=None,
+        verify_hashes=True,
+    ):
+        try:
+            self.reader = IndexedShardReader(
+                corpus_dir,
+                expected_tokenizer_sha256=expected_tokenizer_sha256,
+                expected_recipe_sha256=expected_recipe_sha256,
+                verify_hashes=verify_hashes,
+            )
+            self.sampler = IndexedCorpusSampler(
+                self.reader,
+                source_weights=source_weights,
+            )
+        except (OSError, ShardFormatError) as exc:
+            raise SystemExit(f"Invalid indexed corpus {corpus_dir}: {exc}") from exc
+        self.batch_size = int(batch_size)
+        self.block_size = int(block_size)
+        self.device = device
+
+    @property
+    def corpus_sha256(self):
+        return self.reader.manifest["corpus_sha256"]
+
+    @property
+    def source_ids(self):
+        return self.sampler.source_ids
+
+    def get_batch(self, rng, source_id=None):
+        packed = self.sampler.sample_batch(
+            batch_size=self.batch_size,
+            block_size=self.block_size,
+            rng=rng,
+            source_id=source_id,
+        )
+        input_ids = torch.from_numpy(packed.input_ids.astype(np.int64, copy=False))
+        labels = torch.from_numpy(packed.labels)
+        position_ids = torch.from_numpy(packed.position_ids)
+        return (
+            input_ids.to(self.device, non_blocking=True),
+            labels.to(self.device, non_blocking=True),
+            {
+                "position_ids": position_ids.to(self.device, non_blocking=True),
+                # Transformers only detects reset-position packed sequences
+                # when no KV cache is active.
+                "use_cache": False,
+            },
+        )
+
+
 def create_data_loader(data_cfg, batch_size, block_size, device, seed):
-    """Create either memmap or streaming data loader based on config."""
+    """Create an indexed, streaming, or flat-memmap data loader."""
+    indexed_cfg = data_cfg.get("indexed", {}) or {}
+    if indexed_cfg.get("enabled", False):
+        train_dir = indexed_cfg.get("train_dir")
+        val_dir = indexed_cfg.get("val_dir")
+        if not train_dir or not val_dir:
+            raise SystemExit(
+                "indexed.train_dir and indexed.val_dir are required when "
+                "indexed.enabled=true"
+            )
+        common = {
+            "batch_size": batch_size,
+            "block_size": block_size,
+            "device": device,
+            "expected_tokenizer_sha256": indexed_cfg.get("tokenizer_sha256"),
+            "expected_recipe_sha256": indexed_cfg.get("recipe_sha256"),
+            "verify_hashes": indexed_cfg.get("verify_hashes", True),
+        }
+        train_loader = IndexedDataLoader(
+            train_dir,
+            source_weights=indexed_cfg.get("source_weights"),
+            **common,
+        )
+        validation_source_weights = indexed_cfg.get("validation_source_weights")
+        if validation_source_weights is None:
+            validation_source_weights = indexed_cfg.get("source_weights")
+        val_loader = IndexedDataLoader(
+            val_dir,
+            source_weights=validation_source_weights,
+            **common,
+        )
+        print(
+            "[data] Indexed corpora loaded: "
+            f"train={train_loader.corpus_sha256[:12]} "
+            f"val={val_loader.corpus_sha256[:12]}"
+        )
+        return {"mode": "indexed", "train": train_loader, "val": val_loader}
+
     streaming_cfg = data_cfg.get("streaming", {})
     
     if streaming_cfg.get("enabled", False):
@@ -932,17 +1304,80 @@ def create_data_loader(data_cfg, batch_size, block_size, device, seed):
         return {"mode": "memmap", "train": train_data, "val": val_data}
 
 
+def get_model_batch(data, data_mode, batch_size, block_size, rng, device):
+    """Return input IDs, labels, and any model kwargs for one batch."""
+    if data_mode == "indexed":
+        return data.get_batch(rng)
+    if data_mode == "streaming":
+        x, y = data.get_batch()
+        return x, y, {}
+    x, y = get_batch(data, batch_size, block_size, rng, device)
+    return x, y, {}
+
+
 @torch.no_grad()
-def evaluate(model, data, batch_size, block_size, rng, device, batches, accelerator):
+def evaluate(
+    model,
+    data,
+    batch_size,
+    block_size,
+    rng,
+    device,
+    batches,
+    accelerator,
+    data_mode="memmap",
+):
     model.eval()
     losses = []
     for _ in range(batches):
-        x, y = get_batch(data, batch_size, block_size, rng, device)
-        outputs = model(input_ids=x, labels=y)
+        x, y, model_kwargs = get_model_batch(
+            data,
+            data_mode,
+            batch_size,
+            block_size,
+            rng,
+            device,
+        )
+        outputs = model(input_ids=x, labels=y, **model_kwargs)
         losses.append(outputs.loss.detach())
     loss_tensor = torch.stack(losses)
     loss_tensor = accelerator.gather(loss_tensor)
     return loss_tensor.mean().item()
+
+
+@torch.no_grad()
+def evaluate_indexed_by_source(
+    model,
+    data,
+    rng,
+    batches,
+    accelerator,
+):
+    """Return held-out loss, perplexity, and evaluated tokens per source."""
+    if not isinstance(data, IndexedDataLoader):
+        raise TypeError("source-aware evaluation requires indexed validation data")
+    model.eval()
+    results = {}
+    for source_id in data.source_ids:
+        losses = []
+        for _ in range(batches):
+            x, y, model_kwargs = data.get_batch(rng, source_id=source_id)
+            loss = model(input_ids=x, labels=y, **model_kwargs).loss.detach()
+            losses.append(loss)
+        loss_tensor = accelerator.gather(torch.stack(losses))
+        mean_loss = loss_tensor.mean().item()
+        results[source_id] = {
+            "loss": mean_loss,
+            "perplexity": math.exp(min(20, mean_loss)),
+            "batches": int(batches * accelerator.num_processes),
+            "tokens": int(
+                batches
+                * accelerator.num_processes
+                * data.batch_size
+                * data.block_size
+            ),
+        }
+    return results
 
 
 def maybe_apply_budget_guard(budget, tokens_per_step):
@@ -958,7 +1393,7 @@ def maybe_apply_budget_guard(budget, tokens_per_step):
         return None
     target_tokens = budget.get("target_tokens", 0)
     hourly_rate = budget.get("hourly_rate", 0.0)
-    max_cost = budget.get("max_cost", 0.0)
+    max_cost = budget.get("run_max_cost", budget.get("max_cost", 0.0))
     if target_tokens <= 0 or hourly_rate <= 0 or max_cost <= 0:
         return None
     total_hours = target_tokens / tokens_per_sec / 3600.0
@@ -1013,6 +1448,22 @@ def rotate_checkpoints(output_dir, limit, protected=None):
 def _load_json(path):
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def _append_jsonl(path, record):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                record,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            + "\n"
+        )
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 def _load_yaml_or_json(path):
@@ -1094,9 +1545,20 @@ class RuntimeControl:
         self.poll_interval_steps = max(1, int(cfg.get("poll_interval_steps", 50)))
         self.control_path = cfg.get("control_path") or os.path.join(output_dir, "runtime_control.yaml")
         self.command_path = cfg.get("command_path") or os.path.join(output_dir, "commands.jsonl")
+        self.cursor_path = cfg.get("cursor_path") or os.path.join(
+            output_dir, "runtime_cursor.json"
+        )
         self.allowed_updates = set(cfg.get("allowed_updates", []))
         self._last_control_mtime = None
         self._command_offset = 0
+        if self.enabled and os.path.exists(self.cursor_path):
+            try:
+                cursor = _load_json(self.cursor_path)
+                self._command_offset = max(
+                    0, int(cursor.get("command_offset", 0))
+                )
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                self._command_offset = 0
 
     def poll(self, step):
         if not self.enabled or step % self.poll_interval_steps != 0:
@@ -1114,6 +1576,15 @@ class RuntimeControl:
                         updates["checks.fixed_prompt.prompt_list_path"] = payload["prompt_list_path"]
                 self._last_control_mtime = mtime
         commands, self._command_offset = _read_command_queue(self.command_path, self._command_offset)
+        atomic_write_json(
+            Path(self.cursor_path),
+            {
+                "schema_version": 1,
+                "command_path": os.path.abspath(self.command_path),
+                "command_offset": self._command_offset,
+                "updated_at": _utc_now_iso(),
+            },
+        )
         return updates, commands
 
 
@@ -1383,6 +1854,7 @@ def sample_generate(
 def run_overfit_microset(
     model,
     train_data,
+    data_mode,
     data_cfg,
     optim_cfg,
     accelerator,
@@ -1403,29 +1875,52 @@ def run_overfit_microset(
     min_drop = check_cfg.get("min_drop", 0.3)
     target_loss = check_cfg.get("target_loss")
 
-    microset_tokens = int(check_cfg.get("tokens", 5_000_000))
-    microset_tokens = min(microset_tokens, len(train_data))
-    if microset_tokens <= block_size + 1:
-        raise SystemExit("Overfit microset too small for block_size.")
-
-    microset_data = train_data[:microset_tokens]
-    if accelerator.is_main_process:
-        print(
-            f"[overfit check] tokens={microset_tokens} steps={steps} "
-            f"micro_batch={micro_batch} grad_accum={grad_accum}"
-        )
-
     eval_seed = check_cfg.get("eval_seed", optim_cfg["seed"] + 12345)
-    initial_loss = evaluate(
-        model,
-        microset_data,
-        micro_batch,
-        block_size,
-        np.random.default_rng(eval_seed),
-        accelerator.device,
-        eval_batches,
-        accelerator,
-    )
+    fixed_batch = None
+    if data_mode == "memmap":
+        microset_tokens = int(check_cfg.get("tokens", 5_000_000))
+        microset_tokens = min(microset_tokens, len(train_data))
+        if microset_tokens <= block_size + 1:
+            raise SystemExit("Overfit microset too small for block_size.")
+        microset_data = train_data[:microset_tokens]
+        if accelerator.is_main_process:
+            print(
+                f"[overfit check] tokens={microset_tokens} steps={steps} "
+                f"micro_batch={micro_batch} grad_accum={grad_accum}"
+            )
+        initial_loss = evaluate(
+            model,
+            microset_data,
+            micro_batch,
+            block_size,
+            np.random.default_rng(eval_seed),
+            accelerator.device,
+            eval_batches,
+            accelerator,
+        )
+    else:
+        fixed_batch = get_model_batch(
+            train_data,
+            data_mode,
+            micro_batch,
+            block_size,
+            np.random.default_rng(eval_seed),
+            accelerator.device,
+        )
+        if accelerator.is_main_process:
+            print(
+                f"[overfit check] fixed {data_mode} batch steps={steps} "
+                f"micro_batch={micro_batch} grad_accum={grad_accum}"
+            )
+        model.eval()
+        with torch.no_grad():
+            x, y, model_kwargs = fixed_batch
+            initial_loss_tensor = model(
+                input_ids=x,
+                labels=y,
+                **model_kwargs,
+            ).loss.detach().reshape(1)
+            initial_loss = accelerator.gather(initial_loss_tensor).mean().item()
 
     overfit_param_groups, _ = build_adamw_param_groups(model, optim_cfg["weight_decay"])
     optimizer = torch.optim.AdamW(
@@ -1446,9 +1941,19 @@ def run_overfit_microset(
         model.train()
         step_loss = 0.0
         for _ in range(grad_accum):
-            x, y = get_batch(microset_data, micro_batch, block_size, rng, accelerator.device)
+            if fixed_batch is None:
+                x, y = get_batch(
+                    microset_data,
+                    micro_batch,
+                    block_size,
+                    rng,
+                    accelerator.device,
+                )
+                model_kwargs = {}
+            else:
+                x, y, model_kwargs = fixed_batch
             with accelerator.accumulate(model):
-                outputs = model(input_ids=x, labels=y)
+                outputs = model(input_ids=x, labels=y, **model_kwargs)
                 loss = outputs.loss
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
@@ -1464,16 +1969,27 @@ def run_overfit_microset(
             avg_loss = step_loss / grad_accum
             print(f"[overfit check] step {step}/{steps} loss={avg_loss:.4f}")
 
-    final_loss = evaluate(
-        model,
-        microset_data,
-        micro_batch,
-        block_size,
-        np.random.default_rng(eval_seed),
-        accelerator.device,
-        eval_batches,
-        accelerator,
-    )
+    if fixed_batch is None:
+        final_loss = evaluate(
+            model,
+            microset_data,
+            micro_batch,
+            block_size,
+            np.random.default_rng(eval_seed),
+            accelerator.device,
+            eval_batches,
+            accelerator,
+        )
+    else:
+        model.eval()
+        with torch.no_grad():
+            x, y, model_kwargs = fixed_batch
+            final_loss_tensor = model(
+                input_ids=x,
+                labels=y,
+                **model_kwargs,
+            ).loss.detach().reshape(1)
+            final_loss = accelerator.gather(final_loss_tensor).mean().item()
     if accelerator.is_main_process:
         drop = (initial_loss - final_loss) / max(1e-6, initial_loss)
         print(
@@ -1582,10 +2098,18 @@ def run_fixed_prompt_sample(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train a 100M Llama-style model.")
+    parser = argparse.ArgumentParser(description="Train a configured Llama-style language model.")
     parser.add_argument("--model_config", default="configs/model_100m.yaml")
     parser.add_argument("--train_config", default="configs/train.yaml")
     parser.add_argument("--resume_from", default=None)
+    parser.add_argument(
+        "--initialize_from",
+        default=None,
+        help=(
+            "Load model.pt from a fingerprint-validated base checkpoint while "
+            "starting a new optimizer and scheduler."
+        ),
+    )
     parser.add_argument("--resume_from_slot", default=None)
     parser.add_argument(
         "--resume_from_hf",
@@ -1608,10 +2132,12 @@ def main():
     checks_cfg = train_cfg.get("checks", {})
     logging_cfg = train_cfg.get("logging", {})
     runtime_cfg = train_cfg.get("runtime_control", {})
+    observability_cfg = train_cfg.get("observability", {})
     checkpoint_cfg = train_cfg.get("checkpoint_slots", {})
     checkpoint_upload_cfg = train_cfg.get("checkpoint_upload", {})
     overfit_cfg = checks_cfg.get("overfit_microset", {})
     fixed_prompt_cfg = checks_cfg.setdefault("fixed_prompt", {})
+    source_eval_cfg = checks_cfg.get("source_eval", {}) or {}
 
     _verify_tokenizer_compat(model_cfg, train_cfg, data_cfg)
     _normalize_runtime_values(optim_cfg)
@@ -1636,9 +2162,10 @@ def main():
         device=device,
         seed=optim_cfg["seed"],
     )
-    streaming_mode = data_loader["mode"] == "streaming"
-    train_data = data_loader["train"]  # Either np.memmap or StreamingDataLoader
-    val_data = data_loader["val"]  # np.memmap (or None)
+    data_mode = data_loader["mode"]
+    streaming_mode = data_mode == "streaming"
+    train_data = data_loader["train"]
+    val_data = data_loader["val"]
 
     config = LlamaConfig(
         vocab_size=model_cfg["vocab_size"],
@@ -1659,6 +2186,21 @@ def main():
         eos_token_id=model_cfg["eos_token_id"],
     )
     model = LlamaForCausalLM(config)
+    initialize_from = args.initialize_from or optim_cfg.get("initialize_from")
+    initialization_lineage = None
+    if initialize_from:
+        initialization_lineage = _load_initial_weights(
+            model,
+            initialize_from,
+            model_config_path=args.model_config,
+            tokenizer_path=_resolve_tokenizer_path(train_cfg),
+        )
+        if accelerator.is_main_process:
+            print(
+                "[initialize] Loaded base weights "
+                f"{initialization_lineage['model_sha256'][:12]} "
+                f"from {initialization_lineage['checkpoint_dir']}"
+            )
     if optim_cfg.get("gradient_checkpointing", False):
         model.gradient_checkpointing_enable()
 
@@ -1688,6 +2230,12 @@ def main():
         train_cfg,
         data_cfg,
     )
+    if initialization_lineage is not None:
+        artifact_manifest["initialization"] = initialization_lineage
+    compatibility_fingerprint = _training_compatibility_fingerprint(
+        artifact_manifest
+    )
+    artifact_manifest["compatibility_fingerprint"] = compatibility_fingerprint
     artifact_manifest_path = None
     if accelerator.is_main_process:
         artifact_manifest_path = _save_artifact_manifest(output_dir, artifact_manifest)
@@ -1718,6 +2266,12 @@ def main():
 
     runtime_control = RuntimeControl(runtime_cfg, output_dir)
     metrics_logger = MetricsLogger(logging_cfg, output_dir, accelerator.is_main_process)
+    run_observer = RunObserver(
+        observability_cfg,
+        output_dir,
+        is_main_process=accelerator.is_main_process,
+        budget=budget_cfg,
+    )
     manifest = _load_checkpoint_manifest(output_dir)
     best_slots = max(0, int(checkpoint_cfg.get("best", 2)))
     good_slots = list(checkpoint_cfg.get("good", ["good_1", "good_2"]) or [])
@@ -1757,7 +2311,15 @@ def main():
     if overfit_cfg.get("enabled", False) and (not args.smoke or overfit_cfg.get("run_on_smoke", False)):
         model = accelerator.prepare(model)
         model_prepared = True
-        run_overfit_microset(model, train_data, data_cfg, optim_cfg, accelerator, overfit_cfg)
+        run_overfit_microset(
+            model,
+            train_data,
+            data_mode,
+            data_cfg,
+            optim_cfg,
+            accelerator,
+            overfit_cfg,
+        )
     elif accelerator.is_main_process and overfit_cfg.get("enabled", False) and args.smoke:
         print("[overfit check] skipped on smoke run.")
 
@@ -1795,6 +2357,8 @@ def main():
         args.smoke,
     )
 
+    rng = np.random.default_rng(optim_cfg["seed"] + accelerator.process_index)
+    completed_steps = 0
     resume_path = args.resume_from
     resume_from_hf = args.resume_from_hf or checkpoint_upload_cfg.get("resume_from_hf")
     if args.resume_from_slot:
@@ -1826,15 +2390,44 @@ def main():
     if resume_path:
         print(f"[resume] Loading state from {resume_path}")
         accelerator.load_state(resume_path)
+        if streaming_mode:
+            raise SystemExit(
+                "Exact resume is not yet supported for the streaming loader because "
+                "its iterator and token buffer are not checkpointed."
+            )
+        restored_counters = {}
+        completed_steps = load_training_progress(
+            resume_path,
+            rng,
+            process_index=accelerator.process_index,
+            expected_compatibility_fingerprint=compatibility_fingerprint,
+            counters=restored_counters,
+        )
+        print(
+            f"[resume] Restored batch RNG after {completed_steps} completed steps; "
+            f"next step is {completed_steps + 1}."
+        )
 
-    rng = np.random.default_rng(optim_cfg["seed"] + accelerator.process_index)
-    tokens_processed = 0
+    tokens_processed = completed_steps * tokens_per_step
+    supervised_tokens_processed = int(
+        (restored_counters if resume_path else {}).get("supervised_tokens", 0)
+    )
+    session_tokens_processed = 0
+    session_supervised_tokens = 0
     start_time = time.time()
     last_val_loss = None
     last_grad_norm = None
     stop_training = False
+    stop_reason = None
+    run_observer.start(
+        max_steps=max_steps,
+        completed_steps=completed_steps,
+        tokens_processed=tokens_processed,
+        compatibility_fingerprint=compatibility_fingerprint,
+        experiment=train_cfg.get("experiment"),
+    )
 
-    for step in range(1, max_steps + 1):
+    for step in range(completed_steps + 1, max_steps + 1):
         updates, commands = runtime_control.poll(step)
         cmd_updates, actions = _parse_runtime_commands(commands, good_slots)
         updates.update(cmd_updates)
@@ -1850,6 +2443,7 @@ def main():
                     lr_scheduler.base_lrs = [new_lr for _ in lr_scheduler.base_lrs]
             if accelerator.is_main_process:
                 metrics_logger.maybe_print(f"[runtime] applied updates: {applied}")
+                run_observer.event("runtime_updates_applied", updates=applied, step=step)
 
         save_requested = False
         if actions["sample_prompts"]:
@@ -1896,17 +2490,29 @@ def main():
         if actions["stop_training"]:
             stop_training = True
             save_requested = actions["save_now"]
+            stop_reason = "runtime stop requested"
+            if accelerator.is_main_process:
+                run_observer.event(
+                    "runtime_stop_requested",
+                    step=step,
+                    save_now=save_requested,
+                )
 
         model.train()
         step_loss = 0.0
+        step_supervised_tokens_local = 0
         for _ in range(grad_accum):
-            # Get batch from streaming or memmap loader
-            if streaming_mode:
-                x, y = train_data.get_batch()
-            else:
-                x, y = get_batch(train_data, micro_batch, block_size, rng, device)
+            x, y, model_kwargs = get_model_batch(
+                train_data,
+                data_mode,
+                micro_batch,
+                block_size,
+                rng,
+                device,
+            )
+            step_supervised_tokens_local += int((y != -100).sum().item())
             with accelerator.accumulate(model):
-                outputs = model(input_ids=x, labels=y)
+                outputs = model(input_ids=x, labels=y, **model_kwargs)
                 loss = outputs.loss
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
@@ -1923,9 +2529,21 @@ def main():
             step_loss += loss.item()
 
         tokens_processed += tokens_per_step
+        session_tokens_processed += tokens_per_step
+        supervised_count = torch.tensor(
+            step_supervised_tokens_local,
+            device=device,
+            dtype=torch.int64,
+        )
+        supervised_count = accelerator.reduce(supervised_count, reduction="sum")
+        step_supervised_tokens = int(supervised_count.item())
+        supervised_tokens_processed += step_supervised_tokens
+        session_supervised_tokens += step_supervised_tokens
+        completed_steps = step
         if accelerator.is_main_process and step % optim_cfg["log_interval"] == 0:
             elapsed = time.time() - start_time
-            tps = tokens_processed / max(1e-6, elapsed)
+            tps = session_tokens_processed / max(1e-6, elapsed)
+            supervised_tps = session_supervised_tokens / max(1e-6, elapsed)
             avg_loss = step_loss / grad_accum
             current_lr = optimizer.param_groups[0]["lr"] if optimizer.param_groups else 0.0
             metrics = {
@@ -1933,26 +2551,36 @@ def main():
                 "train/lr": current_lr,
                 "train/tokens_per_sec": tps,
                 "train/tokens": tokens_processed,
+                "train/supervised_tokens": supervised_tokens_processed,
+                "train/supervised_tokens_per_sec": supervised_tps,
             }
             if last_grad_norm is not None:
                 metrics["train/grad_norm"] = last_grad_norm
             metrics.update(_get_gpu_stats())
             metrics_logger.log_metrics(step, metrics)
+            run_observer.metrics(step, metrics)
             metrics_logger.maybe_print(
                 f"step {step}/{max_steps} loss={avg_loss:.4f} "
-                f"lr={current_lr:.2e} tps={tps:.0f}"
+                f"lr={current_lr:.2e} tps={tps:.0f} "
+                f"target_tps={supervised_tps:.0f}"
             )
 
         if step % optim_cfg["eval_interval"] == 0:
+            eval_rng = np.random.default_rng(
+                int(optim_cfg["seed"])
+                + accelerator.process_index
+                + step * 1_000_003
+            )
             val_loss = evaluate(
                 model,
                 val_data,
                 micro_batch,
                 block_size,
-                rng,
+                eval_rng,
                 device,
                 batches=20 if args.smoke else 100,
                 accelerator=accelerator,
+                data_mode=data_mode,
             )
             last_val_loss = val_loss
             ppl = math.exp(min(20, val_loss))
@@ -1965,6 +2593,54 @@ def main():
                         "eval/ppl": ppl,
                     },
                 )
+                run_observer.metrics(
+                    step,
+                    {
+                        "eval/loss": val_loss,
+                        "eval/ppl": ppl,
+                    },
+                )
+                run_observer.evaluation(step, val_loss, ppl)
+            if data_mode == "indexed" and source_eval_cfg.get("enabled", True):
+                source_batches = int(
+                    source_eval_cfg.get(
+                        "batches",
+                        2 if args.smoke else 20,
+                    )
+                )
+                source_results = evaluate_indexed_by_source(
+                    model,
+                    val_data,
+                    eval_rng,
+                    max(1, source_batches),
+                    accelerator,
+                )
+                if accelerator.is_main_process:
+                    source_metrics = {}
+                    for source_id, result in source_results.items():
+                        source_metrics[
+                            f"eval/source/{source_id}/loss"
+                        ] = result["loss"]
+                        source_metrics[
+                            f"eval/source/{source_id}/ppl"
+                        ] = result["perplexity"]
+                        print(
+                            f"eval source={source_id} "
+                            f"loss={result['loss']:.4f} "
+                            f"ppl={result['perplexity']:.2f} "
+                            f"tokens={result['tokens']:,}"
+                        )
+                    metrics_logger.log_metrics(step, source_metrics)
+                    run_observer.metrics(step, source_metrics)
+                    _append_jsonl(
+                        os.path.join(output_dir, "source_eval.jsonl"),
+                        {
+                            "schema_version": 1,
+                            "step": step,
+                            "validation_corpus_sha256": val_data.corpus_sha256,
+                            "sources": source_results,
+                        },
+                    )
             run_fixed_prompt_sample(
                 model,
                 accelerator,
@@ -1980,6 +2656,15 @@ def main():
             ckpt_dir = _make_local_checkpoint_dir(output_dir, ckpt_dir_name, local_checkpoint_mode)
             accelerator.wait_for_everyone()
             accelerator.save_state(ckpt_dir)
+            save_training_progress(
+                ckpt_dir,
+                completed_steps,
+                rng,
+                process_index=accelerator.process_index,
+                compatibility_fingerprint=compatibility_fingerprint,
+                counters={"supervised_tokens": supervised_tokens_processed},
+            )
+            accelerator.wait_for_everyone()
             if accelerator.is_main_process:
                 unwrapped = accelerator.unwrap_model(model)
                 torch.save(unwrapped.state_dict(), os.path.join(ckpt_dir, "model.pt"))
@@ -2007,6 +2692,16 @@ def main():
                 if best_slots > 0:
                     _update_best_slots(manifest, ckpt_dir_name, last_val_loss, best_slots)
                 _save_checkpoint_manifest(output_dir, manifest)
+                run_observer.checkpoint(
+                    step,
+                    ckpt_dir_name,
+                    uploaded=bool(uploaded_ok),
+                    local_path=(
+                        ckpt_dir_name
+                        if local_checkpoint_mode == "persistent"
+                        else None
+                    ),
+                )
 
                 if should_upload and uploaded_ok:
                     checkpoint_uploader.prune_remote(manifest)
@@ -2034,6 +2729,32 @@ def main():
                         protected=_protected_steps(manifest),
                     )
 
+        local_budget_stop = False
+        if (
+            observability_cfg.get("enabled", False)
+            and step % run_observer.heartbeat_interval_steps == 0
+        ):
+            local_budget_stop = run_observer.heartbeat(
+                step=step,
+                tokens_processed=tokens_processed,
+                force=True,
+            )
+            budget_flag = torch.tensor(
+                1 if local_budget_stop else 0,
+                device=device,
+                dtype=torch.int32,
+            )
+            budget_flag = accelerator.reduce(budget_flag, reduction="sum")
+            if int(budget_flag.item()) > 0:
+                stop_training = True
+                stop_reason = "runtime budget limit reached"
+                save_requested = True
+                if accelerator.is_main_process:
+                    metrics_logger.maybe_print(
+                        "[budget] Runtime cost limit reached; stopping after "
+                        "a recovery checkpoint."
+                    )
+
         if stop_training:
             break
 
@@ -2042,6 +2763,15 @@ def main():
     if local_checkpoint_mode == "ephemeral" and not keep_local_final:
         final_dir = _make_local_checkpoint_dir(output_dir, "final", local_checkpoint_mode)
     accelerator.save_state(final_dir)
+    save_training_progress(
+        final_dir,
+        completed_steps,
+        rng,
+        process_index=accelerator.process_index,
+        compatibility_fingerprint=compatibility_fingerprint,
+        counters={"supervised_tokens": supervised_tokens_processed},
+    )
+    accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         unwrapped = accelerator.unwrap_model(model)
         torch.save(unwrapped.state_dict(), os.path.join(final_dir, "model.pt"))
@@ -2049,7 +2779,11 @@ def main():
 
         final_uploaded = False
         if checkpoint_uploader and checkpoint_uploader.enabled:
-            final_uploaded = checkpoint_uploader.upload(final_dir, step, is_final=True)
+            final_uploaded = checkpoint_uploader.upload(
+                final_dir,
+                completed_steps,
+                is_final=True,
+            )
             if final_uploaded:
                 checkpoint_uploader.prune_remote(manifest)
 
@@ -2063,6 +2797,17 @@ def main():
             ),
         }
         _save_checkpoint_manifest(output_dir, manifest)
+        run_observer.checkpoint(
+            completed_steps,
+            "final",
+            uploaded=bool(final_uploaded),
+            local_path=(
+                "final"
+                if os.path.abspath(final_dir)
+                == os.path.abspath(os.path.join(output_dir, "final"))
+                else None
+            ),
+        )
         if checkpoint_uploader and checkpoint_uploader.enabled:
             if artifact_upload_files:
                 checkpoint_uploader.upload_artifacts(artifact_upload_files)
@@ -2085,11 +2830,21 @@ def main():
                 f"Local final checkpoint remains at: {final_dir}"
             )
 
+        if stop_reason == "runtime budget limit reached":
+            run_observer.terminal("budget_stopped", reason=stop_reason)
+        elif stop_reason:
+            run_observer.terminal("signal_stopped", reason=stop_reason)
+        else:
+            run_observer.terminal("completed")
+
         # Stop streaming data loader if active
         if streaming_mode:
             train_data.stop()
 
         cleanup_logging()
+
+    if stop_reason:
+        raise SystemExit(f"Training stopped safely: {stop_reason}")
 
 
 if __name__ == "__main__":

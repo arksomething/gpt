@@ -112,6 +112,9 @@ def _run_repl(sp, train_data, val_data, rng, max_show_tokens, max_text_chars):
             length = int(parts[2]) if len(parts) > 2 else 128
             count = int(parts[3]) if len(parts) > 3 else 1
             data = train_data if split == "train" else val_data
+            if data is None:
+                print(f"No {split} data file is available.")
+                continue
             _sample_tokens(sp, data, rng, count, length, max_show_tokens, max_text_chars)
             continue
         print("Unknown command. Type 'encode', 'decode', 'piece', or 'sample'.")
@@ -120,8 +123,8 @@ def _run_repl(sp, train_data, val_data, rng, max_show_tokens, max_text_chars):
 def main():
     parser = argparse.ArgumentParser(description="Inspect tokenizer + tokenized data.")
     parser.add_argument("--tokenizer_model", default="tokenizer/spm.model")
-    parser.add_argument("--train_bin", default="data/train.bin")
-    parser.add_argument("--val_bin", default="data/val.bin")
+    parser.add_argument("--train_bin", default="data/v3/train.bin")
+    parser.add_argument("--val_bin", default="data/v3/val.bin")
     parser.add_argument("--dtype", default="uint16")
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--encode", default=None)
@@ -136,11 +139,6 @@ def main():
     args = parser.parse_args()
 
     sp = _load_sp(args.tokenizer_model)
-    dtype = _parse_dtype(args.dtype)
-    train_data = _load_memmap(args.train_bin, dtype)
-    val_data = _load_memmap(args.val_bin, dtype)
-    rng = random.Random(args.seed)
-
     if args.encode is not None:
         ids = sp.encode(args.encode, out_type=int)
         _show_tokens(sp, ids, args.max_show_tokens, args.max_text_chars)
@@ -149,11 +147,26 @@ def main():
         ids = _parse_id_list(args.decode)
         _show_tokens(sp, ids, args.max_show_tokens, args.max_text_chars)
         return
+
+    dtype = _parse_dtype(args.dtype)
+    rng = random.Random(args.seed)
+
     if args.sample:
-        data = train_data if args.split == "train" else val_data
+        data_path = args.train_bin if args.split == "train" else args.val_bin
+        data = _load_memmap(data_path, dtype)
         _sample_tokens(sp, data, rng, args.count, args.length, args.max_show_tokens, args.max_text_chars)
         return
 
+    train_data = (
+        np.memmap(args.train_bin, dtype=dtype, mode="r")
+        if os.path.exists(args.train_bin)
+        else None
+    )
+    val_data = (
+        np.memmap(args.val_bin, dtype=dtype, mode="r")
+        if os.path.exists(args.val_bin)
+        else None
+    )
     _run_repl(sp, train_data, val_data, rng, args.max_show_tokens, args.max_text_chars)
 
 

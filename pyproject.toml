@@ -1,7 +1,7 @@
 [project]
-name = "llm-100m"
-version = "0.1.0"
-description = "Train a ~100M parameter Llama-style model on RTX 4090s."
+name = "gpt-training-lab"
+version = "0.2.0"
+description = "Run controlled language-model experiments from small probes toward 1B parameters."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -14,6 +14,11 @@ dependencies = [
   "transformers",
   "tqdm",
   "huggingface-hub>=1.3.5",
+]
+
+[dependency-groups]
+dev = [
+  "pytest",
 ]
 
 [build-system]
@@ -34,4 +39,12 @@ tokenizer-repl = "scripts.tokenizer_repl:main"
 scan-bins = "scripts.scan_bins:main"
 infer = "scripts.infer:main"
 quick-lm-eval = "scripts.quick_lm_eval:main"
-
+validate-model-ladder = "scripts.validate_model_ladder:main"
+experiment = "scripts.experiment_registry:main"
+canonical-writing = "scripts.canonical_writing:main"
+probe-preflight = "scripts.preflight_probe:main"
+run-status = "scripts.run_observer:main"
+prepare-chat-data = "scripts.prepare_chat_data:main"
+generate-chat-data = "scripts.generate_chat_data:main"
+chat-review = "scripts.chat_review:main"
+conversation-eval = "scripts.conversation_eval:main"

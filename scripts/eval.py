@@ -229,7 +229,9 @@ def main():
 
     # Load defaults from config, allow CLI overrides
     eval_cfg = train_cfg.get("eval", {})
-    args.checkpoint = args.checkpoint or eval_cfg.get("checkpoint", "runs/llama-100m/final")
+    args.checkpoint = args.checkpoint or eval_cfg.get(
+        "checkpoint", "runs/llama-100m-v3/final"
+    )
     args.tokenizer_model = args.tokenizer_model or eval_cfg.get("tokenizer_model", "tokenizer/spm.model")
     args.batches = args.batches if args.batches is not None else eval_cfg.get("batches", 200)
     args.prompt = args.prompt or eval_cfg.get("prompt", "The quick brown fox")

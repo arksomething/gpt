@@ -1,10 +1,27 @@
+# Historical corrected 100M v3 recipe. Retained as the current executable
+# baseline while the probe pipeline is implemented. Do not launch a full run
+# without restoring the fingerprint-matched train shard and passing Gate 0.
 data:
   train_bin: data/v3/train.bin
-  val_bin: data/v3/val.bin
+  # v3 val.bin was inherited from v2 under a different (lost) tokenizer and
+  # decodes to noise; quarantined 2026-07-29. val_fresh.bin is clean.
+  val_bin: data/v3/val_fresh.bin
   block_size: 2048
   dtype: uint16
   vocab_size: 32000
   hf_repo: null  # Optional HF pre-tokenized dataset; must match tokenizer exactly
+
+  # Preferred format for new experiments. When enabled, this takes precedence
+  # over both the flat memmap and Hugging Face streaming modes.
+  indexed:
+    enabled: false
+    train_dir: null
+    val_dir: null
+    tokenizer_sha256: null  # Optional explicit expectation; manifests are always checked
+    recipe_sha256: null
+    verify_hashes: true
+    source_weights: null  # e.g. {fineweb_edu: 0.50, wikipedia: 0.20, writing: 0.30}
+    validation_source_weights: null
   
   # Streaming mode - load data directly from HuggingFace without storing locally
   streaming:
@@ -17,13 +34,19 @@ data:
 data_prep:
   tokenizer_model: tokenizer/spm.model
   out_dir: data/v3
+  output_format: flat  # Historical reproduction default; use indexed for new probes
+  target_shard_tokens: 10000000
   train_tokens: 2000000000
   val_tokens: 20000000
+  validation_fraction: 0.01  # Content-hash split before filtering/chunking
   
   # Active source weights (should sum to ~1.0 across enabled sources)
   c4_weight: 0.30
   wiki_weight: 0.50
   fineweb_weight: 0.20
+  canonical_writing:
+    manifest: null  # Built by `uv run canonical-writing`; human-kept docs only
+    weight: 0.00
   # Backward-compatible alias; ignored when fineweb_weight is set.
   gutenberg_weight: 0.00
   
@@ -121,7 +144,7 @@ checkpoint_slots:
   good: []
 
 checkpoint_upload:
-  enabled: true  # Requires HF_TOKEN or huggingface-cli login
+  enabled: false  # Historical repo; enable explicitly only for an intentional reproduction
   repo_id: ark296/llama-100m-v3-checkpoints
   upload_interval: 1000  # Upload every N steps (ignored in ephemeral mode; every save uploads)
   upload_optimizer: true  # Kept for compatibility; exact-resume mode uploads full checkpoint folders
@@ -145,17 +168,26 @@ logging:
     log_dir: null
   wandb:
     enabled: false
-    project: llm-100m
+    project: gpt-training-lab
     name: null
     entity: null
     tags: []
     group: null
     config: null
 
+observability:
+  enabled: true
+  heartbeat_interval_steps: 10
+  state_file: run_state.json
+  events_file: events.jsonl
+  metrics_file: metrics.jsonl
+  budget_alarm_fractions: [0.50, 0.80, 0.95]
+
 runtime_control:
   enabled: true
   control_path: null  # defaults to {output_dir}/runtime_control.yaml
   command_path: null  # defaults to {output_dir}/commands.jsonl
+  cursor_path: null  # persists command offset so resume cannot replay old commands
   poll_interval_steps: 10
   # Edit runtime_control.yaml during training to change these on the fly:
   allowed_updates:
@@ -182,6 +214,9 @@ budget:
   throughput_path: runs/throughput.json
 
 checks:
+  source_eval:
+    enabled: true
+    batches: 20  # Per source; indexed validation only
   overfit_microset:
     enabled: true
     tokens: 5000000

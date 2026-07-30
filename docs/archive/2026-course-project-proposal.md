@@ -1,4 +1,8 @@
-# Final Project Proposal
+# Archived: Final Project Proposal
+
+> Historical document. This proposal describes the original controlled
+> 100M-parameter GPT-2-versus-Llama class project. It is preserved for context
+> but is no longer the project roadmap. See [`../../PLAN.md`](../../PLAN.md).
 
 ## Title
 **Which Modern Language-Model Techniques Still Help at Small Scale?**  

@@ -7,6 +7,7 @@ Implements filtering rules:
 - C4-specific (C0-C6): Stricter filters for web content
 - Wikipedia-specific (W0-W4): Strip non-prose, keep paragraphs
 - Gutenberg-specific (GUT0-GUT5): Strip boilerplate, normalize
+- Source cleanup (CLEAN0-CLEAN8): Per-source document repair and triage
 """
 
 import math
@@ -14,7 +15,7 @@ import re
 import string
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 # Common punctuation for ratio calculations
 COMMON_PUNCT = set(".,!?;:'\"-()[]{}…")
@@ -1213,6 +1214,466 @@ def apply_gutenberg_filters(
         return text, False, "GUT2_poetry_heavy"
 
     return text, True, ""
+
+
+# =============================================================================
+# Source Cleanup Layer (CLEAN0-CLEAN8)
+# =============================================================================
+
+# Navigation/UI lines that carry no content wherever they appear (CLEAN0)
+WEB_CHROME_LINE_PATTERNS = [
+    re.compile(r"^skip to (?:main )?content$", re.IGNORECASE),
+    re.compile(r"^(?:jump|skip) to (?:navigation|search)$", re.IGNORECASE),
+    re.compile(r"^toggle navigation$", re.IGNORECASE),
+    re.compile(r"^(?:menu|search|home|download|share|print|donate|copy link)$", re.IGNORECASE),
+    re.compile(r"^\[.{0,60}\]$"),  # placeholder blocks: "[Quote Of The Day]"
+    re.compile(r"^(?:certainty|importance|confidence|status):\s*.{0,40}$", re.IGNORECASE),
+    re.compile(r"^(?:similar|bibliography|backlinks|finished|in progress|draft)$", re.IGNORECASE),
+    re.compile(r"^\d{4}-\d{2}-\d{2}(?:\s*[–—-]\s*\d{4}-\d{2}-\d{2})?$"),  # page date stamps
+]
+
+# Footer headings that only ever start trailing link dumps
+FOOTER_MARKERS_ANYWHERE = {
+    "our latest data insights",
+    "see all data insights",
+    "related topic pages",
+    "explore this data",
+}
+# Generic headings: only treat as footer when they appear late in the document
+FOOTER_MARKERS_TAIL = {
+    "similar links",
+    "external links",
+    "bibliography",
+    "link bibliography",
+    "backlinks",
+    "see also",
+    "further reading",
+    "continue reading",
+}
+
+
+def _normalize_marker(line: str) -> str:
+    return line.strip().lower().rstrip(":→… ")
+
+
+def _collapse_toc_runs(text: str, min_run: int = 4) -> str:
+    """
+    Remove bare TOC line-lists: runs of >= min_run consecutive single-line
+    heading-like blocks (short, capitalized, no terminal punctuation).
+    """
+    blocks = re.split(r"\n\s*\n", text)
+
+    def heading_like(block: str) -> bool:
+        stripped = block.strip()
+        if not stripped or "\n" in block:
+            return False
+        if len(stripped) >= 60 or stripped[-1] in ".!?;,":
+            return False
+        if re.match(r"^[\*\-•]\s", stripped):
+            return False
+        return stripped[0].isupper() or stripped[0].isdigit()
+
+    result: List[str] = []
+    run: List[str] = []
+    for block in blocks:
+        if heading_like(block):
+            run.append(block)
+            continue
+        if run:
+            if len(run) < min_run:
+                result.extend(run)
+            run = []
+        result.append(block)
+    if run and len(run) < min_run:
+        result.extend(run)
+    return "\n\n".join(result)
+
+
+def strip_web_chrome(text: str) -> str:
+    """
+    CLEAN0: Remove HTML-extraction chrome: leading nav junk, page metadata
+    lines, bare TOC line-lists, and trailing link-dump/footer blocks.
+    """
+    lines = [
+        line
+        for line in text.split("\n")
+        if not any(pattern.match(line.strip()) for pattern in WEB_CHROME_LINE_PATTERNS)
+    ]
+
+    # Cut trailing footer at the first footer heading; generic headings such
+    # as "Bibliography" only count when no real prose follows them (a TOC
+    # entry with the same name is followed by the body).
+    def prose_follows(start: int) -> bool:
+        return any(
+            len(line.strip()) > 120 and line.rstrip()[-1:] in ".!?\"’”"
+            for line in lines[start:]
+        )
+
+    cutoff = len(lines)
+    for index, line in enumerate(lines):
+        marker = _normalize_marker(line)
+        if index > 0 and marker in FOOTER_MARKERS_ANYWHERE:
+            cutoff = index
+            break
+        if marker in FOOTER_MARKERS_TAIL and not prose_follows(index + 1):
+            cutoff = index
+            break
+    text = "\n".join(lines[:cutoff])
+
+    text = _collapse_toc_runs(text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+# Publisher advertising blocks (CLEAN1), e.g. the IntechOpen pattern
+PUBLISHER_BOILERPLATE_PATTERNS = [
+    re.compile(r"\bwe are intechopen\b", re.IGNORECASE),
+    re.compile(r"\bbuilt by scientists, for scientists\b", re.IGNORECASE),
+    re.compile(r"\bopen access books? (?:available|published)\b", re.IGNORECASE),
+    re.compile(r"\binternational authors and editors\b", re.IGNORECASE),
+    re.compile(r"[\d,.]+\s*[MK]?\+\s*downloads", re.IGNORECASE),
+    re.compile(r"\bcountries delivered to\b", re.IGNORECASE),
+    re.compile(r"\btop 1% most cited scientists\b", re.IGNORECASE),
+    re.compile(r"\bcontributors from top 500 universities\b", re.IGNORECASE),
+    re.compile(r"\bbook citation index\b", re.IGNORECASE),
+    re.compile(r"\binterested in publishing with us\b", re.IGNORECASE),
+    re.compile(r"\bfor more information visit www\.", re.IGNORECASE),
+]
+
+# Bare stat lines inside ad blocks: "187,000+", "12.2%"
+_STAT_LINE_PATTERN = re.compile(r"^[\d,.]+\s*%?\+?$")
+
+
+def strip_publisher_boilerplate(text: str) -> str:
+    """CLEAN1: Remove publisher advertising lines (download counts, publish-with-us CTAs)."""
+    kept: List[str] = []
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if _STAT_LINE_PATTERN.match(stripped):
+            continue
+        if any(pattern.search(stripped) for pattern in PUBLISHER_BOILERPLATE_PATTERNS):
+            continue
+        kept.append(line)
+    text = "\n".join(kept)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def strip_markdown_residue(text: str) -> str:
+    """CLEAN2: Remove markdown/HTML residue left by upstream conversion (**, <sup>, ### headings)."""
+    text = re.sub(r"</?su[bp]>", "", text)
+    text = text.replace("**", "")
+    text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
+    return text
+
+
+_LIST_ITEM_PATTERN = re.compile(r"^\s*(?:[\*\-•●]|\d+[\.\)])\s+")
+
+
+def reflow_hard_wrapped(text: str) -> str:
+    """
+    CLEAN3: Join hard-wrapped lines into paragraphs.
+    A line continues the previous one when it is indented (PDF-extraction
+    continuation, even across a blank line) or starts lowercase directly
+    after the previous line. Real paragraph breaks (blank line followed by
+    a flush-left line) and list items are preserved.
+    """
+    out_lines: List[str] = []
+    buffer: List[str] = []
+    pending_blank = False
+
+    def flush() -> None:
+        if buffer:
+            out_lines.append(" ".join(buffer))
+            buffer.clear()
+
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if not stripped:
+            pending_blank = True
+            continue
+        if _LIST_ITEM_PATTERN.match(line):
+            flush()
+            if pending_blank and out_lines:
+                out_lines.append("")
+            pending_blank = False
+            out_lines.append(stripped)
+            continue
+        indented = line[:1] in (" ", "\t")
+        if buffer and (indented or (stripped[0].islower() and not pending_blank)):
+            buffer.append(stripped)
+            pending_blank = False
+            continue
+        flush()
+        if pending_blank and out_lines:
+            out_lines.append("")
+        pending_blank = False
+        buffer.append(stripped)
+    flush()
+    return "\n".join(out_lines).strip()
+
+
+# Front-matter detection for academic documents (CLEAN4)
+_DOI_PATTERN = re.compile(r"\b10\.\d{4,9}/\S+")
+_FRONT_MATTER_KEYWORDS = re.compile(
+    r"\b(?:universit|department|institute|faculty|laborator|hospital|"
+    r"research article|editor|e-?mail|received|accepted|copyright|licensee|"
+    r"correspondence|affiliation|doi)\w*\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_front_matter(block: str) -> bool:
+    words = block.split()
+    if not words:
+        return False
+    keyword_hits = len(_FRONT_MATTER_KEYWORDS.findall(block))
+    capitalized = sum(1 for word in words if word[0].isupper() or word[0].isdigit())
+    # (?<![A-Z]) keeps author initials ("Michael E. Habicht") from counting
+    sentence_ends = len(re.findall(r"(?<![A-Z])[.!?](?:\s|$)", block))
+    signals = 0
+    if _DOI_PATTERN.search(block):
+        signals += 1
+    if keyword_hits >= 3:
+        signals += 1
+    if capitalized / len(words) >= 0.35:
+        signals += 1
+    # Front matter is name/affiliation-dense and nearly sentence-free
+    return signals >= 2 and sentence_ends / len(words) < 0.03
+
+
+def _strip_front_matter_prefix(paragraph: str, window: int = 15) -> str:
+    """
+    Within a paragraph whose head looks like front matter, cut at the first
+    prose sentence: a capitalized word followed by a lowercase-heavy window.
+    """
+    words = paragraph.split()
+    if len(words) < 40:
+        return paragraph
+    head = " ".join(words[:30])
+    if not (_DOI_PATTERN.search(head) or len(_FRONT_MATTER_KEYWORDS.findall(head)) >= 2):
+        return paragraph
+    for index in range(1, len(words) - window):
+        if not words[index][0].isupper():
+            continue
+        chunk = words[index + 1 : index + window]
+        lower = sum(1 for word in chunk if word[0].islower())
+        if lower / len(chunk) >= 0.6:
+            return " ".join(words[index:])
+    return paragraph
+
+
+def strip_front_matter(text: str) -> str:
+    """
+    CLEAN4: Drop DOI/author/affiliation runs at the head of academic docs.
+    Removes leading front-matter paragraphs, then trims any front-matter
+    prefix fused into the first surviving paragraph.
+    """
+    paragraphs = re.split(r"\n\s*\n", text)
+    start = 0
+    for paragraph in paragraphs:
+        stripped = paragraph.strip()
+        # Cap whole-block drops: a huge front-matter-ish block is front
+        # matter fused with body text and gets a prefix trim instead
+        if stripped and len(stripped.split()) <= 150 and _looks_like_front_matter(stripped):
+            start += 1
+        else:
+            break
+    remaining = paragraphs[start:]
+    if remaining:
+        remaining[0] = _strip_front_matter_prefix(remaining[0])
+    return "\n\n".join(remaining).strip()
+
+
+_FIGURE_CAPTION_PATTERN = re.compile(r"^(?:fig(?:ure)?\.?|table)\s*[A-Z]?\d+[.:]?\s", re.IGNORECASE)
+
+
+def _strip_figure_captions(text: str) -> str:
+    """Drop standalone figure/table caption paragraphs interrupting prose."""
+    blocks = re.split(r"\n\s*\n", text)
+    kept = [
+        block
+        for block in blocks
+        if not (_FIGURE_CAPTION_PATTERN.match(block.strip()) and len(block.strip()) < 600)
+    ]
+    return "\n\n".join(kept).strip()
+
+
+_REPORT_TOC_HEADINGS = {"contents", "figures", "tables", "appendixes", "appendices"}
+_REPORT_TOC_ENTRY_PATTERN = re.compile(r"^(?:figure|table|appendix)\b", re.IGNORECASE)
+
+
+def _strip_report_toc(text: str) -> str:
+    """Drop Contents/Figures/Tables listing blocks from report-style documents."""
+    blocks = re.split(r"\n\s*\n", text)
+    result: List[str] = []
+    skipping = False
+    for block in blocks:
+        stripped = block.strip()
+        if stripped.lower() in _REPORT_TOC_HEADINGS:
+            skipping = True
+            continue
+        if skipping:
+            is_entry = bool(stripped) and all(
+                _REPORT_TOC_ENTRY_PATTERN.match(line.strip())
+                or (line.strip() and len(line.strip()) < 80 and line.strip()[-1] not in ".!?")
+                for line in stripped.split("\n")
+            )
+            if is_entry:
+                continue
+            skipping = False
+        result.append(block)
+    return "\n\n".join(result).strip()
+
+
+# Non-prose detection (CLEAN5)
+_CODE_LINE_PATTERN = re.compile(
+    r"^\s*(?:import\s|from\s+\S+\s+import\s|module\s+[A-Z]|#include|package\s|"
+    r"//|/\*|\*/|--\s|\{-|def\s|class\s|function[\s(]|var\s|let\s|const\s|"
+    r"return[\s;]|if\s*\(|for\s*\(|while\s*\()"
+)
+_CODE_LINE_ENDINGS = (";", "{", "}", "[", "=", "&&", "||", "=>")
+_CODE_SYMBOLS = set("{}[]<>=;|\\@#$%^&*_~")
+_PROSE_STOPWORDS = {
+    "the", "of", "and", "to", "a", "in", "is", "that", "it", "was", "for",
+    "on", "with", "as", "be", "at", "by", "this", "have", "from", "or",
+    "had", "not", "are", "but", "he", "she", "they", "his", "her",
+}
+
+
+def is_prose(text: str) -> bool:
+    """
+    CLEAN5: Reject non-prose content: binary residue (replacement chars,
+    weird symbols) and source code (symbol density, code-shaped lines,
+    near-absence of English function words).
+    """
+    stripped = text.strip()
+    if not stripped:
+        return False
+    if stripped.count("�") > max(2, len(stripped) // 2000):
+        return False
+    if compute_weird_ratio(stripped) > 0.05:
+        return False
+    if compute_alpha_ratio(stripped) < 0.50:
+        return False
+    if sum(1 for c in stripped if c in _CODE_SYMBOLS) / len(stripped) > 0.03:
+        return False
+    lines = [line for line in stripped.split("\n") if line.strip()]
+    code_lines = sum(
+        1
+        for line in lines
+        if _CODE_LINE_PATTERN.match(line)
+        or line.rstrip().endswith(_CODE_LINE_ENDINGS)
+        or "::" in line
+    )
+    # Line-shape statistics are meaningless without real line structure
+    if len(lines) >= 5 and code_lines / len(lines) > 0.15:
+        return False
+    words = re.findall(r"[a-zA-Z']+", stripped.lower())
+    if len(words) >= 50:
+        stopword_fraction = sum(1 for word in words if word in _PROSE_STOPWORDS) / len(words)
+        if stopword_fraction < 0.10:
+            return False
+    return True
+
+
+# Wikimedia article-namespace triage (CLEAN6)
+WIKI_NON_ARTICLE_PREFIXES = (
+    "talk:", "template:", "template talk:", "wikipedia:", "wikipedia talk:",
+    "user:", "user talk:", "portal:", "portal talk:", "category:",
+    "category talk:", "file:", "file talk:", "draft:", "module:",
+    "mediawiki:", "help:",
+)
+_WIKI_BOT_SIGNATURE = re.compile(
+    r"\b(?:InternetArchiveBot|cyberbot|SineBot|Lowercase sigmabot)\b|\(Report bug\)"
+)
+_WIKI_HEADING_PATTERN = re.compile(r"^==+[^=]+==+$")
+
+
+def wikimedia_is_article(text: str) -> bool:
+    """
+    CLEAN6: Heuristic for real article pages. Rejects talk/template/portal/
+    AfD-style pages: namespace-prefixed titles, bot notices, (UTC) signature
+    timestamps, wiki template braces, ==heading== density, bullet-only bodies.
+    """
+    stripped = text.strip()
+    if not stripped:
+        return False
+    lines = stripped.split("\n")
+    title = lines[0].strip().lower()
+    if title.startswith(WIKI_NON_ARTICLE_PREFIXES):
+        return False
+    if _WIKI_BOT_SIGNATURE.search(stripped):
+        return False
+    if stripped.count("(UTC)") >= 2:
+        return False
+    if stripped.count("{{") >= 3:
+        return False
+    non_blank = [line.strip() for line in lines if line.strip()]
+    headings = sum(1 for line in non_blank if _WIKI_HEADING_PATTERN.match(line))
+    if len(non_blank) >= 5 and headings / len(non_blank) > 0.10:
+        return False
+    bullets = sum(1 for line in non_blank if re.match(r"^[\*\-•]\s", line))
+    if len(non_blank) >= 5 and bullets / len(non_blank) > 0.50:
+        return False
+    return True
+
+
+def shingle_jaccard(text_a: str, text_b: str, shingle_size: int = 5) -> float:
+    """
+    CLEAN7: Jaccard similarity over word shingles. Machine-templated
+    near-duplicates (country-profile pages) score far above distinct prose.
+    """
+
+    def shingles(text: str) -> Set[Tuple[str, ...]]:
+        words = re.findall(r"[a-z0-9']+", text.lower())
+        if len(words) < shingle_size:
+            return {tuple(words)} if words else set()
+        return {
+            tuple(words[index : index + shingle_size])
+            for index in range(len(words) - shingle_size + 1)
+        }
+
+    set_a = shingles(text_a)
+    set_b = shingles(text_b)
+    if not set_a or not set_b:
+        return 0.0
+    return len(set_a & set_b) / len(set_a | set_b)
+
+
+# Per-source cleanup pipelines (source ids as in data/sources.yaml)
+SOURCE_CLEANERS: Dict[str, Tuple[Callable[[str], str], ...]] = {
+    "gwern": (strip_web_chrome,),
+    "our_world_in_data": (strip_web_chrome,),
+    "common_pile_doab": (strip_publisher_boilerplate, strip_markdown_residue),
+    "crs_reports": (reflow_hard_wrapped, _strip_report_toc),
+    "plos": (strip_front_matter, _strip_figure_captions),
+}
+
+DEFAULT_MIN_CLEAN_CHARS = 500
+# DOAB chunks under 1.5k chars are orphan fragments (bare abstracts, blurbs)
+SOURCE_MIN_CLEAN_CHARS = {"common_pile_doab": 1500}
+
+
+def clean_document(text: str, source_id: str) -> Optional[str]:
+    """
+    CLEAN8: Apply the per-source cleanup pipeline.
+    Returns the cleaned text, or None if the document should be dropped
+    (non-prose, non-article, or too short after cleaning).
+    """
+    if not text or not text.strip():
+        return None
+    if source_id == "common_pile_wikimedia" and not wikimedia_is_article(text):
+        return None
+    if not is_prose(text):
+        return None
+    cleaned = text
+    for transform in SOURCE_CLEANERS.get(source_id, ()):
+        cleaned = transform(cleaned)
+    cleaned = cleaned.strip()
+    if len(cleaned) < SOURCE_MIN_CLEAN_CHARS.get(source_id, DEFAULT_MIN_CLEAN_CHARS):
+        return None
+    return cleaned
 
 
 # =============================================================================
