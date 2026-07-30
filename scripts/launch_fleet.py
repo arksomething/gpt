@@ -12,6 +12,11 @@ the region is free.
 User-data is base64-encoded: an earlier attempt at inline heredocs had its
 export lines silently collapse, which is the sort of failure that only shows up
 after you have paid for the box.
+
+Presigning needs boto3, which is deliberately not a locked dependency (the
+training boxes use plain curl and should not install it), so run this as:
+
+    uv run --with boto3 --with 'botocore[crt]' launch-fleet ...
 """
 
 from __future__ import annotations
@@ -36,8 +41,31 @@ def sh(cmd: List[str], **kw) -> str:
     ).stdout.strip()
 
 
-def runner_script(arm: str, corpus_url: str, branch: str, lifetime: int) -> str:
-    """The script the box runs. Kept flat: no nested quoting, no heredocs."""
+def presign(bucket: str, key: str, ttl: int, method: str = "get") -> str:
+    """Presign an S3 URL.
+
+    `aws s3 presign` cannot sign PUT requests (no --http-method on this CLI
+    version), and the shipper needs an upload URL, so this goes through boto3.
+    """
+    import boto3  # imported lazily so --dry_run works without credentials
+
+    client = boto3.client("s3", region_name=REGION)
+    op = "put_object" if method == "put" else "get_object"
+    return client.generate_presigned_url(
+        op, Params={"Bucket": bucket, "Key": key}, ExpiresIn=ttl
+    )
+
+
+def runner_script(
+    arm: str, corpus_url: str, ship_url: str, branch: str, lifetime: int, ship_every: int
+) -> str:
+    """The script the box runs. Kept flat: no nested quoting, no heredocs.
+
+    The shipper is the durability guarantee. Checkpoints go out over a
+    presigned PUT URL, which needs no credentials on the box -- so a spot
+    preemption, a kill-switch shutdown, or a crash costs at most one ship
+    interval instead of the whole run.
+    """
     return f"""#!/bin/bash
 set -x
 exec > >(tee -a /var/log/gate1-arm.log) 2>&1
@@ -46,6 +74,31 @@ export HOME=/root
 export PATH=/root/.local/bin:/usr/local/bin:/usr/bin:/bin
 
 shutdown -h +{lifetime * 60} || true
+
+RUNDIR=/root/gpt/runs/gate1/{arm}
+
+ship() {{
+  # Tar to a temp name and move into place so a PUT never reads a partial file.
+  mkdir -p "$RUNDIR"
+  tar -cf /tmp/ship.tmp -C /root/gpt/runs/gate1 {arm} 2>/dev/null || return 1
+  mv -f /tmp/ship.tmp /tmp/ship.tar
+  curl -fsS -X PUT --upload-file /tmp/ship.tar "{ship_url}" && echo "SHIPPED $(date -u +%H:%M:%S)"
+}}
+
+# Periodic shipper: bounded loss window regardless of how the box dies.
+( while true; do sleep {ship_every}; ship || echo SHIP_FAILED; done ) &
+
+# Spot gives a two-minute interruption notice on IMDS. Catching it turns a
+# preemption from "lose the run" into "lose nothing".
+( while true; do
+    TOK=$(curl -fsS -X PUT "http://169.254.169.254/latest/api/token" \
+      -H "X-aws-ec2-metadata-token-ttl-seconds: 300" 2>/dev/null)
+    CODE=$(curl -o /dev/null -w "%{{http_code}}" -fsS \
+      -H "X-aws-ec2-metadata-token: $TOK" \
+      http://169.254.169.254/latest/meta-data/spot/instance-action 2>/dev/null)
+    if [ "$CODE" = "200" ]; then echo SPOT_INTERRUPTION; ship; break; fi
+    sleep 5
+  done ) &
 
 curl -fsSL https://astral.sh/uv/install.sh | sh
 export PATH=/root/.local/bin:$PATH
@@ -87,6 +140,12 @@ def main() -> None:
     ap.add_argument("--lifetime_hours", type=int, default=8)
     ap.add_argument("--url_ttl", type=int, default=43200, help="Presign TTL seconds")
     ap.add_argument(
+        "--ship_every",
+        type=int,
+        default=600,
+        help="Seconds between checkpoint ships; the maximum work a crash can cost",
+    )
+    ap.add_argument(
         "--spot", nargs="*", default=[], help="Arms to place on spot capacity"
     )
     ap.add_argument("--dry_run", action="store_true")
@@ -97,17 +156,16 @@ def main() -> None:
         if not os.path.exists(cfg):
             sys.exit(f"missing {cfg} -- run `uv run gate1-arms` first")
 
-    corpus_url = sh(
-        [
-            "aws", "s3", "presign", f"s3://{args.bucket}/{args.corpus_key}",
-            "--expires-in", str(args.url_ttl), "--region", REGION,
-        ]
-    )
+    corpus_url = presign(args.bucket, args.corpus_key, args.url_ttl, "get")
 
     launched: Dict[str, str] = {}
     for arm in args.arms:
+        # One presigned PUT per arm, reused by the shipper for the whole run.
+        ship_url = presign(
+            args.bucket, f"results/{arm}.tar", args.url_ttl, "put"
+        )
         script = runner_script(
-            arm, corpus_url, args.branch, args.lifetime_hours
+            arm, corpus_url, ship_url, args.branch, args.lifetime_hours, args.ship_every
         ).replace("{BUCKET}", args.bucket)
         user_data = base64.b64encode(script.encode()).decode()
 
