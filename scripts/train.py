@@ -1427,6 +1427,41 @@ def _persist_ephemeral_checkpoint_dir(checkpoint_dir, output_dir, logical_name):
     return fallback_dir
 
 
+def _guard_completed_run(output_dir, args):
+    """Refuse to train over a finished run.
+
+    Nothing here protected a completed model: output_dir was created with
+    exist_ok=True, final/ was overwritten at the end of training, and
+    rotate_checkpoints deleted older step directories. Re-running a recipe --
+    the ordinary way to fix a hyperparameter and try again -- therefore
+    destroyed the previous model silently, with no way to get it back.
+
+    Resuming is a different intent and stays allowed: it is meant to land in
+    the same directory.
+    """
+    final_dir = os.path.join(output_dir, "final")
+    if not os.path.isdir(final_dir):
+        return
+    if getattr(args, "overwrite", False):
+        print(f"[guard] --overwrite given; replacing completed run in {output_dir}")
+        return
+    if any(
+        getattr(args, name, None)
+        for name in ("resume_from", "resume_from_slot", "resume_from_hf")
+    ):
+        return
+    raise SystemExit(
+        f"Refusing to train into {output_dir}: it already holds a completed run "
+        f"({final_dir}).\n"
+        "Starting here would overwrite final/ and prune its checkpoints, and the "
+        "previous model cannot be recovered.\n"
+        "Choose one:\n"
+        "  - point training.output_dir at a new directory (preferred; keeps both)\n"
+        "  - pass --resume_from/--resume_from_slot to continue that run\n"
+        "  - pass --overwrite if you genuinely mean to discard it"
+    )
+
+
 def rotate_checkpoints(output_dir, limit, protected=None):
     """Keep at most `limit` total checkpoints, deleting oldest unprotected first."""
     if limit <= 0:
@@ -2117,6 +2152,11 @@ def main():
         help="Resume from remote HF checkpoint selector: latest|best|final|step_XXXXXXX",
     )
     parser.add_argument("--smoke", action="store_true")
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Discard a completed run already present in training.output_dir.",
+    )
     parser.add_argument("--launch_screen", action="store_true")
     parser.add_argument("--screen_name", default=None)
     args = parser.parse_args()
@@ -2221,6 +2261,7 @@ def main():
         max_steps = min(max_steps, 50)
 
     output_dir = optim_cfg["output_dir"]
+    _guard_completed_run(output_dir, args)
     os.makedirs(output_dir, exist_ok=True)
 
     artifact_manifest = _build_artifact_manifest(
