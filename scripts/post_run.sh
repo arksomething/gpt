@@ -99,7 +99,7 @@ PY
     # loss and perplexity never revealed that round 1 answered the wrong
     # question.
     log "samples"
-    uv run python scripts/conversation_eval.py generate \
+    uv run python scripts/conversation_eval.py generate-local \
       --checkpoint "$SFTDIR/final" --model_config "$MODEL_CONFIG" \
       --tokenizer tokenizer/spm.model \
       --output "$RUNDIR/samples.jsonl" > "$RUNDIR/samples.log" 2>&1

@@ -17,7 +17,10 @@ set -u
 cd /home/ark296/projects/gpt
 BUCKET=gpt-gate1-202518310973
 KEY=$HOME/.ssh/gpt-aws.pem
-SSH="ssh -o StrictHostKeyChecking=no -o ConnectTimeout=12 -i $KEY"
+# -n is load-bearing: ssh reads stdin, and inside the `while read` loop below
+# it swallows the remaining fleet rows. Without it the loop only ever processed
+# the first instance and silently ignored every arm that finished.
+SSH="ssh -n -o StrictHostKeyChecking=no -o ConnectTimeout=12 -i $KEY"
 SG=sg-09ab4b5c96796e292
 SUBNETS="subnet-0d65a3210c0caee6c subnet-0d7d3ddad08b7f486 subnet-0399353261423516e subnet-06ea31b3cc0b5ef21 subnet-0c7178288a8c1e07f"
 QUEUE="${QUEUE:-p2 p3 p4 p5}"
@@ -32,7 +35,7 @@ presign() {  # arm, method
   uv run --with boto3 --with 'botocore[crt]' python -c "
 import sys; sys.path.insert(0,'.')
 from scripts.launch_fleet import presign
-print(presign('$BUCKET','$1',43200,'$2'))" 2>/dev/null | tail -1
+print(presign('$BUCKET','$1',43200,'$2'))" 2>/dev/null </dev/null | tail -1
 }
 
 fleet() {
@@ -98,7 +101,7 @@ while :; do
           # permission denied and silently took the whole chain with it.
           scp -o StrictHostKeyChecking=no -o ConnectTimeout=12 -i "$KEY" -q \
             scripts/box_kick.sh ubuntu@"$IP":/tmp/kick.sh >/dev/null 2>&1
-          $SSH ubuntu@"$IP" "sudo bash /tmp/kick.sh '$ARM' '$SU' '$FU'" >/dev/null 2>&1
+          $SSH ubuntu@"$IP" "sudo bash /tmp/kick.sh '$ARM' '$SU' '$FU'" >/dev/null 2>&1 </dev/null
           echo "POST_RUN_START $ARM"
         else
           echo "TRAIN_FAILED $ARM rc=$DONE_RC"
