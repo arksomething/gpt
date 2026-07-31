@@ -25,7 +25,22 @@ data:
       wiki: 0.025909
       wikiteam: 0.003886
       libretexts: 0.013386
-    validation_source_weights: null
+    validation_source_weights:
+      fineweb: 0.066667
+      dclm: 0.066667
+      finepdfs: 0.066667
+      cosmopedia: 0.066667
+      code: 0.066667
+      finemath: 0.066667
+      stackexchange: 0.066667
+      youtube: 0.066667
+      ubuntu_irc: 0.066667
+      github_archive: 0.066667
+      uk_hansard: 0.066667
+      narrative: 0.066667
+      wiki: 0.066667
+      wikiteam: 0.066667
+      libretexts: 0.066667
   streaming:
     enabled: false
 data_prep:

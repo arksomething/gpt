@@ -23,6 +23,13 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BASE_CONFIG = os.path.join(REPO_ROOT, "configs", "train_25m_probe.yaml")
 OUT_DIR = os.path.join(REPO_ROOT, "configs", "gate1")
 UNION_CORPUS = "data/gate1/union-v2"
+# Every source present in the union corpus. Validation weights them uniformly so
+# the number is identical in meaning for every arm.
+UNION_SOURCES = (
+    "fineweb", "dclm", "finepdfs", "cosmopedia", "code", "finemath",
+    "stackexchange", "youtube", "ubuntu_irc", "github_archive", "uk_hansard",
+    "narrative", "wiki", "wikiteam", "libretexts",
+)
 G6_XLARGE_HOURLY = 0.81  # us-east-1 on-demand; spot runs cost less, never more
 
 # The conversation sub-corpus. OASST's planned 0.5 point is folded into
@@ -117,11 +124,16 @@ def build_config(name: str, arm: Dict[str, object], base: dict) -> dict:
     indexed["enabled"] = True
     indexed["train_dir"] = f"{UNION_CORPUS}/train"
     indexed["val_dir"] = f"{UNION_CORPUS}/validation"
-    # Per-source validation loss must cover every source in the union corpus,
-    # not just the ones this arm trains on: decision rule 2 asks whether an arm
-    # sacrificed a register, which is unanswerable if that register is unscored.
     indexed["source_weights"] = {k: round(v / 100.0, 6) for k, v in arm["mix"].items()}  # type: ignore[union-attr]
-    indexed["validation_source_weights"] = None
+    # Leaving this None makes train.py fall back to source_weights, so each arm
+    # is validated on its OWN mixture -- and an arm trained on more predictable
+    # text scores lower without being a better model. That confounded the first
+    # reading of Gate 1. Weighting every source equally makes the number mean
+    # the same thing for every arm; checks.source_eval is the same idea per
+    # source, and is what the report actually compares on.
+    indexed["validation_source_weights"] = {
+        k: round(1.0 / len(UNION_SOURCES), 6) for k in UNION_SOURCES
+    }
     cfg["training"]["seed"] = arm["seed"]
     cfg["training"]["output_dir"] = f"runs/gate1/{name}"
     cfg["budget"]["throughput_path"] = f"runs/gate1/{name}/throughput.json"

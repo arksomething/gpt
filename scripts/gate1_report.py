@@ -116,7 +116,34 @@ def load_arm(arm: str) -> Dict[str, Any]:
         "rl": rl,
         "samples": _read_jsonl(os.path.join(d, "samples.jsonl"))[:6],
         "sft_loss": _sft_final_loss(d),
+        "uniform_loss": uniform_source_loss(d)[0],
+        "per_source": uniform_source_loss(d)[1],
     }
+
+
+CONVERSATION_SOURCES = {
+    "stackexchange", "youtube", "ubuntu_irc", "github_archive", "uk_hansard",
+}
+
+
+def uniform_source_loss(d: str) -> tuple[Optional[float], Dict[str, float]]:
+    """Mean loss over every source, each scored on equal tokens.
+
+    This is the only cross-arm-comparable number here. Training loss and the
+    mixture-weighted validation loss are each measured on that arm's *own*
+    sampling distribution (validation_source_weights inherits source_weights
+    when unset), so an arm that trains on more predictable text scores lower
+    without being a better model. source_eval evaluates all sources with
+    163,840 tokens each, identically for every arm.
+    """
+    rows = _read_jsonl(os.path.join(d, "source_eval.jsonl"))
+    if not rows:
+        return None, {}
+    srcs = rows[-1].get("sources") or {}
+    per = {k: v["loss"] for k, v in srcs.items() if isinstance(v, dict) and "loss" in v}
+    if not per:
+        return None, {}
+    return statistics.fmean(per.values()), per
 
 
 def _sft_final_loss(d: str) -> Optional[float]:
@@ -150,11 +177,18 @@ def sparkline(points: List[Any], w: int = 240, h: int = 44) -> str:
 
 def build_html(arms: List[Dict[str, Any]], sigma: Optional[float]) -> str:
     e = html.escape
-    present = [a for a in arms if not a["missing"] and a.get("final_loss") is not None]
+    present = [a for a in arms if not a["missing"] and a.get("uniform_loss") is not None]
     baseline = [a for a in present if a["arm"].startswith("b0-")]
     b0_mean = (
-        statistics.fmean([a["final_loss"] for a in baseline]) if baseline else None
+        statistics.fmean([a["uniform_loss"] for a in baseline]) if baseline else None
     )
+    b0_per_source: Dict[str, float] = {}
+    if baseline:
+        keys = set(baseline[0].get("per_source") or {})
+        for k in keys:
+            vals = [b["per_source"][k] for b in baseline if k in (b.get("per_source") or {})]
+            if vals:
+                b0_per_source[k] = statistics.fmean(vals)
 
     rows = []
     for a in sorted(arms, key=lambda x: x["arm"]):
@@ -164,7 +198,7 @@ def build_html(arms: List[Dict[str, Any]], sigma: Optional[float]) -> str:
                 f'<td colspan="7" class="muted">not collected</td></tr>'
             )
             continue
-        fl = a.get("final_loss")
+        fl = a.get("uniform_loss")
         delta = (fl - b0_mean) if (fl is not None and b0_mean is not None) else None
         if delta is None or sigma in (None, 0):
             verdict, cls = "&mdash;", "muted"
@@ -204,6 +238,27 @@ def build_html(arms: List[Dict[str, Any]], sigma: Optional[float]) -> str:
             f'{e(", ".join(failed)) if failed else "all ok"}</td>',
         ]
         rows.append("<tr>" + "".join(cells) + "</tr>")
+
+    per_source_arms = [
+        a for a in sorted(arms, key=lambda x: x["arm"])
+        if not a["missing"] and a.get("per_source") and not a["arm"].startswith("b0-")
+    ]
+    ps_rows = []
+    for src in sorted(b0_per_source, key=lambda k: -abs(
+        (per_source_arms[0]["per_source"].get(k, b0_per_source[k]) - b0_per_source[k])
+        if per_source_arms else 0.0)):
+        dot = "&bull; " if src in CONVERSATION_SOURCES else ""
+        cells = ""
+        for a in per_source_arms:
+            v = (a.get("per_source") or {}).get(src)
+            if v is None:
+                cells += '<td class="num muted">&mdash;</td>'
+            else:
+                dv = v - b0_per_source[src]
+                c = "good" if dv < -0.02 else ("bad" if dv > 0.02 else "muted")
+                cells += f'<td class="num {c}">{dv:+.4f}</td>'
+        ps_rows.append(f'<tr><td>{dot}{e(src)}</td>{cells}</tr>')
+    per_source_rows = "".join(ps_rows)
 
     prompts = load_eval_prompts()
     sample_blocks = []
@@ -287,6 +342,15 @@ differ by chance. A gap smaller than that is not evidence.</p>
 {"".join(rows)}
 </table></div>
 
+<h2>Per-source deltas vs baseline</h2>
+<p class="lede">Where each arm gained and lost. Conversation sources are marked
+&bull;. This is the view that decides a mixture: an arm can be flat overall while
+moving a register you care about.</p>
+<div class="card"><table>
+<tr><th>source</th>{"".join(f'<th class="num">{e(a["arm"])}</th>' for a in per_source_arms)}</tr>
+{per_source_rows}
+</table></div>
+
 <h2>Sample transcripts</h2>
 <p class="lede">Perplexity never revealed that round 1 answered questions it wasn't
 asked. These are the artifacts to actually judge.</p>
@@ -309,9 +373,9 @@ def main() -> None:
 
     arms = [load_arm(a) for a in names]
     seeds = [
-        a["final_loss"]
+        a["uniform_loss"]
         for a in arms
-        if not a["missing"] and a["arm"].startswith("b0-") and a.get("final_loss")
+        if not a["missing"] and a["arm"].startswith("b0-") and a.get("uniform_loss")
     ]
     sigma = statistics.stdev(seeds) if len(seeds) >= 2 else None
 
