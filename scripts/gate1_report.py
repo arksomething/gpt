@@ -48,6 +48,16 @@ def _read_jsonl(path: str) -> List[dict]:
     return rows
 
 
+def load_eval_prompts() -> Dict[str, List[str]]:
+    """case_id -> user turns. samples.jsonl stores responses but not prompts."""
+    out: Dict[str, List[str]] = {}
+    for row in _read_jsonl(os.path.join(REPO_ROOT, "evals", "conversation", "v1.jsonl")):
+        cid = row.get("id")
+        if cid:
+            out[cid] = [str(t.get("user", "")) for t in (row.get("turns") or [])]
+    return out
+
+
 def _arm_dir(arm: str) -> Optional[str]:
     """Tarballs unpack as <arm>/<arm>/... ; tolerate either shape."""
     base = os.path.join(COLLECTED, arm)
@@ -173,37 +183,52 @@ def build_html(arms: List[Dict[str, Any]], sigma: Optional[float]) -> str:
             )
         failed = [k for k, v in (a.get("rc") or {}).items() if v not in (0, None)]
 
-        rows.append(
-            "<tr>"
-            f'<td class="mono">{e(a["arm"])}</td>'
-            f'<td class="curve">{sparkline(a["loss_curve"])}</td>'
-            f'<td class="num">{fl:.4f}</td>'
-            f'<td class="num {cls}">{("%+.4f" % delta) if delta is not None else "&mdash;"}</td>'
-            f'<td class="{cls}">{verdict}</td>'
-            f'<td class="num">{a["sft_loss"]:.3f}</td>' if a.get("sft_loss") is not None
-            else f'<td class="num muted">&mdash;</td>'
-        )
-        rows[-1] += (
-            f'<td class="small">{e(", ".join(rlbits)) or "&mdash;"}</td>'
-            f'<td class="num">${a["cost"]:.2f}</td>' if a.get("cost") is not None
-            else '<td class="num muted">&mdash;</td>'
-        )
-        rows[-1] += (
+        # Built as a list of cells: an inline ternary over a concatenated
+        # f-string applies to the whole string, so one missing value silently
+        # collapsed the entire row to a single cell.
+        sft = a.get("sft_loss")
+        cost = a.get("cost")
+        cells = [
+            f'<td class="mono">{e(a["arm"])}</td>',
+            f'<td class="curve">{sparkline(a["loss_curve"])}</td>',
+            f'<td class="num">{fl:.4f}</td>',
+            f'<td class="num {cls}">'
+            f'{("%+.4f" % delta) if delta is not None else "&mdash;"}</td>',
+            f'<td class="{cls}">{verdict}</td>',
+            f'<td class="num">{sft:.3f}</td>' if sft is not None
+            else '<td class="num muted">&mdash;</td>',
+            f'<td class="small">{e(", ".join(rlbits)) if rlbits else "&mdash;"}</td>',
+            f'<td class="num">${cost:.2f}</td>' if cost is not None
+            else '<td class="num muted">&mdash;</td>',
             f'<td class="small {"bad" if failed else "good"}">'
-            f'{e(", ".join(failed)) if failed else "all ok"}</td></tr>'
-        )
+            f'{e(", ".join(failed)) if failed else "all ok"}</td>',
+        ]
+        rows.append("<tr>" + "".join(cells) + "</tr>")
 
+    prompts = load_eval_prompts()
     sample_blocks = []
     for a in sorted(arms, key=lambda x: x["arm"]):
         if a["missing"] or not a.get("samples"):
             continue
         turns = []
-        for s in a["samples"][:3]:
-            for t in (s.get("turns") or [])[:2]:
-                u = e(str(t.get("user", ""))[:200])
-                r = e(str(t.get("response", t.get("assistant", "")))[:320])
+        for s in a["samples"][:4]:
+            cid = s.get("case_id") or s.get("id") or ""
+            ptxt = prompts.get(cid, [])
+            for i, t in enumerate((s.get("turns") or [])[:2]):
+                u = e(ptxt[i][:200] if i < len(ptxt) else f"[{cid}]")
+                r = e(str(t.get("assistant", t.get("response", "")))[:340])
+                det = t.get("deterministic") or {}
+                wc = det.get("word_count")
+                ok = det.get("passed")
+                badge = ""
+                if ok is not None:
+                    badge = (
+                        f'<span class="{"good" if ok else "bad"} small">'
+                        f'{"checks passed" if ok else "checks failed"}'
+                        f'{f" &middot; {wc}w" if wc else ""}</span>'
+                    )
                 turns.append(
-                    f'<div class="turn"><div class="u">{u}</div>'
+                    f'<div class="turn"><div class="u">{u} {badge}</div>'
                     f'<div class="a">{r}</div></div>'
                 )
         if turns:
