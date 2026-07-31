@@ -48,10 +48,12 @@ echo $? > "$RUNDIR/RC_EXPORT_BASE"; ship
 
 # --- 2. Bench the base model, same harness and limit for every arm.
 log "bench base"
-uv run $PIN --with lm-eval --with datasets python scripts/quick_lm_eval.py \
-  --models local --local_pretrained "$RUNDIR/hf-base" \
-  --local_tokenizer "$RUNDIR/hf-base" --limit "$BENCH_LIMIT" --device cuda \
-  --output_root "$RUNDIR/bench-base" > "$RUNDIR/bench_base.log" 2>&1
+uv run $PIN --with lm-eval --with datasets python -m lm_eval \
+  --model hf \
+  --model_args "pretrained=$RUNDIR/hf-base,tokenizer=$RUNDIR/hf-base,dtype=bfloat16" \
+  --tasks piqa,arc_easy,lambada_openai,wikitext \
+  --limit "$BENCH_LIMIT" --batch_size 8 --device cuda \
+  --output_path "$RUNDIR/bench-base" > "$RUNDIR/bench_base.log" 2>&1
 echo $? > "$RUNDIR/RC_BENCH_BASE"; ship
 
 # --- 3. SFT from the pretrained weights. New optimizer, new output dir: the
@@ -66,7 +68,7 @@ fi
 if [ -d /root/gpt/data/chat/v2/indexed/train ]; then
   log "sft"
   SFTDIR="$RUNDIR/sft"
-  python3 - "$SFTDIR" <<'PY'
+  uv run python - "$SFTDIR" <<'PY' > "$RUNDIR/sft_cfg.log" 2>&1
 import sys, yaml
 cfg = yaml.safe_load(open("configs/train_25m_sft_v2.yaml"))
 cfg["training"]["output_dir"] = sys.argv[1]
