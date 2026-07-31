@@ -43,3 +43,5 @@ __pycache__/
 /tokenizer/archive/
 data/chat/v2/all.jsonl
 data/chat/v2/*.tar
+results/collected/
+results/*.tar
