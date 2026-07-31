@@ -57,7 +57,8 @@ def presign(bucket: str, key: str, ttl: int, method: str = "get") -> str:
 
 
 def runner_script(
-    arm: str, corpus_url: str, ship_url: str, branch: str, lifetime: int, ship_every: int
+    arm: str, corpus_url: str, ship_url: str, branch: str, lifetime: int,
+    ship_every: int, corpus_name: str
 ) -> str:
     """The script the box runs. Kept flat: no nested quoting, no heredocs.
 
@@ -113,17 +114,24 @@ tar -xf /tmp/union.tar -C /root/gpt/data/gate1
 rm -f /tmp/union.tar
 
 uv run --with pytest pytest tests/ -q || {{ echo GATE0_FAILED; shutdown -h now; }}
-uv run review-corpus data/gate1/union-v1/train --per_source 15 || {{ echo CORPUS_FAILED; shutdown -h now; }}
+uv run review-corpus {corpus_name}/train --per_source 15 || {{ echo CORPUS_FAILED; shutdown -h now; }}
 
 uv run train --train_config configs/gate1/{arm}.yaml --model_config configs/model_25m.yaml
-echo "ARM_{arm}_RC=$?"
+RC=$?
+echo "ARM_{arm}_RC=$RC"
+
+# Ship straight away rather than waiting out the periodic interval, then again
+# after the marker so the final state is always what is in S3.
+ship || echo SHIP_FAILED
 
 # Deliberately no shutdown here. A box that terminates the moment training ends
 # takes its results with it -- that is how the first bench run was lost. The box
 # stays up until the results have been copied off and verified locally; the
 # scheduled kill-switch above is the only automatic terminator.
-touch /root/gpt/runs/gate1/{arm}/ARM_DONE
-echo "ARM_{arm}_DONE"
+mkdir -p "$RUNDIR"
+echo "$RC" > "$RUNDIR/ARM_DONE"
+ship || echo SHIP_FAILED
+echo "ARM_{arm}_DONE rc=$RC"
 """
 
 
@@ -131,7 +139,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("arms", nargs="+", help="Arm names, e.g. b0-seed1 p1 p2")
     ap.add_argument("--bucket", required=True)
-    ap.add_argument("--corpus_key", default="union-v1.tar")
+    ap.add_argument("--corpus_key", default="union-v2.tar")
     ap.add_argument("--instance_type", default=DEFAULT_TYPE)
     ap.add_argument("--ami", default=DEFAULT_AMI)
     ap.add_argument("--key_name", default="gpt-key")
@@ -157,6 +165,10 @@ def main() -> None:
             sys.exit(f"missing {cfg} -- run `uv run gate1-arms` first")
 
     corpus_url = presign(args.bucket, args.corpus_key, args.url_ttl, "get")
+    # The tar unpacks to a directory named after the corpus; the arm configs
+    # reference that same path, so a mismatch here means training on the wrong
+    # corpus or on nothing at all.
+    corpus_name = "data/gate1/" + args.corpus_key.removesuffix(".tar")
 
     launched: Dict[str, str] = {}
     for arm in args.arms:
@@ -165,7 +177,8 @@ def main() -> None:
             args.bucket, f"results/{arm}.tar", args.url_ttl, "put"
         )
         script = runner_script(
-            arm, corpus_url, ship_url, args.branch, args.lifetime_hours, args.ship_every
+            arm, corpus_url, ship_url, args.branch, args.lifetime_hours,
+            args.ship_every, corpus_name
         ).replace("{BUCKET}", args.bucket)
         user_data = base64.b64encode(script.encode()).decode()
 
