@@ -100,12 +100,13 @@ while :; do
         if [ "$DONE_RC" = "0" ]; then
           SU=$(presign "results/$ARM.tar" put)
           FU=$(presign "sft-v2.tar" get)
+          RU=$(presign "results/$ARM-report.tar" put)
           # The repo lives under /root, so every step must run as root. An
           # earlier version ran `cd /root/gpt` as ubuntu, which fails with
           # permission denied and silently took the whole chain with it.
           scp -o StrictHostKeyChecking=no -o ConnectTimeout=12 -i "$KEY" -q \
             scripts/box_kick.sh ubuntu@"$IP":/tmp/kick.sh >/dev/null 2>&1 </dev/null
-          $SSH ubuntu@"$IP" "sudo bash /tmp/kick.sh '$ARM' '$SU' '$FU'" >/dev/null 2>&1 </dev/null
+          $SSH ubuntu@"$IP" "sudo bash /tmp/kick.sh '$ARM' '$SU' '$FU' '$RU'" >/dev/null 2>&1 </dev/null
           echo "POST_RUN_START $ARM"
         else
           echo "TRAIN_FAILED $ARM rc=$DONE_RC"
@@ -118,11 +119,12 @@ while :; do
     PR=$($SSH ubuntu@"$IP" "sudo cat /root/gpt/runs/gate1/$ARM/POST_RUN_DONE 2>/dev/null" 2>/dev/null)
     if [ -n "$PR" ]; then
       case " $collected " in *" $ARM "*) continue;; esac
-      aws s3 cp "s3://$BUCKET/results/$ARM.tar" "$RESULTS/$ARM.tar" --only-show-errors 2>/dev/null
-      if [ -s "$RESULTS/$ARM.tar" ] && tar -tf "$RESULTS/$ARM.tar" >/dev/null 2>&1; then
-        SZ=$(stat -c%s "$RESULTS/$ARM.tar")
+      aws s3 cp "s3://$BUCKET/results/$ARM-report.tar" "$RESULTS/$ARM-report.tar" \
+        --only-show-errors 2>/dev/null </dev/null
+      if [ -s "$RESULTS/$ARM-report.tar" ] && tar -tf "$RESULTS/$ARM-report.tar" >/dev/null 2>&1; then
+        SZ=$(stat -c%s "$RESULTS/$ARM-report.tar")
         rm -rf "$RESULTS/$ARM" && mkdir -p "$RESULTS/$ARM"
-        tar -xf "$RESULTS/$ARM.tar" -C "$RESULTS/$ARM"
+        tar -xf "$RESULTS/$ARM-report.tar" -C "$RESULTS/$ARM"
         echo "COLLECTED $ARM ${SZ} bytes -> verified locally"
         collected="$collected $ARM"
         terminate "$IID" "$ARM"

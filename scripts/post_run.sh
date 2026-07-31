@@ -12,6 +12,7 @@ set -u
 ARM="${ARM:?ARM must be set}"
 SHIP_URL="${SHIP_URL:-}"
 SFT_URL="${SFT_URL:-}"
+REPORT_URL="${REPORT_URL:-}"
 RUNDIR="/root/gpt/runs/gate1/$ARM"
 MODEL_CONFIG="${MODEL_CONFIG:-configs/model_25m.yaml}"
 BENCH_LIMIT="${BENCH_LIMIT:-200}"
@@ -119,6 +120,25 @@ PY
         --max_completion_length 96 > "$RUNDIR/rl_$ENV.log" 2>&1
       echo $? > "$RUNDIR/RC_RL_$ENV"; ship
     done
+  fi
+fi
+
+# A small bundle of everything needed to judge the arm, without the weights.
+# The full tarball (~1.8GB with checkpoints) already lives in S3 for
+# durability, but pulling eight of those over a home connection would gate
+# both the report and box termination on hours of transfer.
+if [ -n "$REPORT_URL" ]; then
+  log "report bundle"
+  ( cd /root/gpt/runs/gate1 && \
+    tar --warning=no-file-changed -cf /tmp/report.tar \
+      $(find "$ARM" -maxdepth 2 \
+          \( -name '*.jsonl' -o -name '*.log' -o -name '*.json' -o -name 'RC_*' \
+             -o -name 'ARM_DONE' -o -name 'POST_RUN_DONE' \) \
+          -not -path '*/hf-base/*' -not -path '*/hf-chat/*' \
+          -not -path '*/final/*' -not -path '*/sft/step_*' 2>/dev/null) 2>/dev/null )
+  if [ -s /tmp/report.tar ]; then
+    curl -fsS -X PUT --upload-file /tmp/report.tar "$REPORT_URL" >/dev/null \
+      && log "report bundle shipped ($(stat -c%s /tmp/report.tar) bytes)"
   fi
 fi
 
