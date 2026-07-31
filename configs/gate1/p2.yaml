@@ -22,9 +22,9 @@ data:
       finemath: 0.069091
       code: 0.077727
       narrative: 0.025909
-      wiki: 0.017273
-      wikiteam: 0.017273
-      libretexts: 0.008636
+      wiki: 0.025909
+      wikiteam: 0.004318
+      libretexts: 0.012955
     validation_source_weights: null
   streaming:
     enabled: false

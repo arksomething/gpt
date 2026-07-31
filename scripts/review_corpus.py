@@ -14,9 +14,10 @@ from __future__ import annotations
 import argparse
 import os
 import random
+import re
 import sys
 from collections import defaultdict
-from typing import Dict, List
+from typing import Callable, Dict, List
 
 import sentencepiece as spm
 
@@ -28,6 +29,30 @@ from scripts.data_quality import (  # noqa: E402
     vocab_word_set,
 )
 from scripts.indexed_shards import IndexedShardReader  # noqa: E402
+
+
+# Some sources carry structural scaffolding that is not prose and never will
+# be: IRC timestamps and nicknames are the clear case. The readability score
+# counts dictionary words, so that scaffolding drags the score down even when
+# every character is exactly right -- ubuntu_irc measures 0.618 raw and 0.746
+# once the markup is removed.
+#
+# The scaffolding is stripped before scoring rather than the threshold being
+# lowered for that source. Lowering a threshold blunts the check; removing
+# known-good markup leaves it sharp, because tokens that are genuinely
+# scrambled still score terribly after stripping.
+_IRC_TIMESTAMP = re.compile(r"\[\d{2}:\d{2}(?::\d{2})?\]")
+_IRC_NICK = re.compile(r"<[^>\s]{1,20}>")
+_IRC_ACTION = re.compile(r"^\s*\*\s+\S+", re.MULTILINE)
+
+
+def _strip_irc_markup(text: str) -> str:
+    return _IRC_ACTION.sub(" ", _IRC_NICK.sub(" ", _IRC_TIMESTAMP.sub(" ", text)))
+
+
+SCORING_NORMALIZERS: Dict[str, Callable[[str], str]] = {
+    "ubuntu_irc": _strip_irc_markup,
+}
 
 
 def review(
@@ -61,20 +86,25 @@ def review(
         total_tokens = sum(d.token_count for d in docs)
         sample = rng.sample(docs, min(per_source, len(docs)))
 
+        normalizer = SCORING_NORMALIZERS.get(source_id)
         scores: List[float] = []
         excerpt = ""
         for doc in sample:
             text = sp.decode(reader.read_tokens(doc).tolist())
-            score = text_readability(text, words)
+            scored_text = normalizer(text) if normalizer else text
+            score = text_readability(scored_text, words)
             if score is not None:
                 scores.append(score)
+            # The excerpt shows the real decoded text, never the normalized
+            # form -- a human reviewing this must see what is actually stored.
             if not excerpt:
                 excerpt = " ".join(text.split())[:excerpt_chars]
 
         header = (
             f"=== {source_id}  "
             f"{len(docs):,} docs / {total_tokens:,} tokens / "
-            f"{len(scores)} scored ==="
+            f"{len(scores)} scored"
+            f"{' / markup-normalized' if normalizer else ''} ==="
         )
         if not scores:
             print(header)

@@ -36,7 +36,13 @@ CONVERSATION = {
     "github_archive": 1.5,
     "uk_hansard": 1.0,
 }
-REFERENCE = {"wiki": 2.0, "wikiteam": 2.0, "libretexts": 1.0}
+# wikiteam was designed at 2.0 and cannot supply it. Its content is dominated by
+# near-duplicate template pages (`Template:Cite web/doc` and friends), so dedup
+# removes most of it: the whole filtered source yields ~0.5M usable tokens, and a
+# 2% slice of a 250M-token run would have meant repeating it ten times over. That
+# is memorization, not a reference register. The mass moves to Wikipedia and
+# LibreTexts, which keeps the reference slice at 5 and keeps it de-monopolized.
+REFERENCE = {"wiki": 3.0, "wikiteam": 0.5, "libretexts": 1.5}
 
 
 def _mix(**overrides: float) -> Dict[str, float]:
