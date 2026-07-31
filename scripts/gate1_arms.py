@@ -110,6 +110,12 @@ ARMS: Dict[str, Dict[str, object]] = {
         "mix": _mix(dclm=30.0, fineweb=13.0),
         "note": "anti-P1: DCLM 15->30, Edu 28->13",
     },
+    # Winner-confirm. P2 was the only arm inside noise, and every other
+    # perturbation lost, so there are no winning directions to combine: the
+    # shipped candidate IS P2. Two further seeds test whether -0.0043 holds or
+    # was one draw from the seed distribution.
+    "p2-seed2": {"seed": 2024, "mix": _P2, "note": "winner-confirm: P2 seed 2"},
+    "p2-seed3": {"seed": 7331, "mix": _P2, "note": "winner-confirm: P2 seed 3"},
 }
 
 for _name, _arm in ARMS.items():
