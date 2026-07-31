@@ -58,7 +58,7 @@ def presign(bucket: str, key: str, ttl: int, method: str = "get") -> str:
 
 def runner_script(
     arm: str, corpus_url: str, ship_url: str, branch: str, lifetime: int,
-    ship_every: int, corpus_name: str
+    ship_every: int, corpus_name: str, is_spot: bool = True
 ) -> str:
     """The script the box runs. Kept flat: no nested quoting, no heredocs.
 
@@ -67,6 +67,8 @@ def runner_script(
     preemption, a kill-switch shutdown, or a crash costs at most one ship
     interval instead of the whole run.
     """
+    spot_watcher_open = "" if is_spot else ": <<'NO_SPOT_WATCHER'\n"
+    spot_watcher_close = "" if is_spot else "\nNO_SPOT_WATCHER"
     return f"""#!/bin/bash
 set -x
 exec > >(tee -a /var/log/gate1-arm.log) 2>&1
@@ -90,8 +92,10 @@ ship() {{
 ( while true; do sleep {ship_every}; ship || echo SHIP_FAILED; done ) &
 
 # Spot gives a two-minute interruption notice on IMDS. Catching it turns a
-# preemption from "lose the run" into "lose nothing".
-( while true; do
+# preemption from "lose the run" into "lose nothing". Only armed on spot: on an
+# on-demand box the endpoint always 404s and the poll loop buries the training
+# output under `set -x` trace lines.
+{spot_watcher_open}( while true; do
     TOK=$(curl -fsS -X PUT "http://169.254.169.254/latest/api/token" \
       -H "X-aws-ec2-metadata-token-ttl-seconds: 300" 2>/dev/null)
     CODE=$(curl -o /dev/null -w "%{{http_code}}" -fsS \
@@ -99,7 +103,7 @@ ship() {{
       http://169.254.169.254/latest/meta-data/spot/instance-action 2>/dev/null)
     if [ "$CODE" = "200" ]; then echo SPOT_INTERRUPTION; ship; break; fi
     sleep 5
-  done ) &
+  done ) &{spot_watcher_close}
 
 curl -fsSL https://astral.sh/uv/install.sh | sh
 export PATH=/root/.local/bin:$PATH
@@ -156,6 +160,16 @@ def main() -> None:
     ap.add_argument(
         "--spot", nargs="*", default=[], help="Arms to place on spot capacity"
     )
+    ap.add_argument(
+        "--spot_types",
+        nargs="*",
+        default=["g6.xlarge", "g5.xlarge"],
+        help="Spot instance types to try in order. bf16-capable only: a T4 "
+        "(g4dn) would force fp16 and make that arm incomparable.",
+    )
+    ap.add_argument(
+        "--subnets", nargs="*", default=[], help="Subnets (AZs) to try per type"
+    )
     ap.add_argument("--dry_run", action="store_true")
     args = ap.parse_args()
 
@@ -178,7 +192,7 @@ def main() -> None:
         )
         script = runner_script(
             arm, corpus_url, ship_url, args.branch, args.lifetime_hours,
-            args.ship_every, corpus_name
+            args.ship_every, corpus_name, arm in args.spot
         ).replace("{BUCKET}", args.bucket)
         user_data = base64.b64encode(script.encode()).decode()
 
@@ -209,14 +223,49 @@ def main() -> None:
                   f"{' (spot)' if arm in args.spot else ''}")
             continue
 
-        try:
-            instance_id = sh(cmd)
-            launched[arm] = instance_id
-            market = "spot" if arm in args.spot else "on-demand"
-            print(f"launched {arm:10s} {instance_id}  {args.instance_type} ({market})",
-                  flush=True)
-        except subprocess.CalledProcessError as e:
-            print(f"FAILED  {arm}: {e.stderr.strip()[:300]}", flush=True)
+        if arm not in args.spot:
+            try:
+                instance_id = sh(cmd)
+                launched[arm] = instance_id
+                print(f"launched {arm:10s} {instance_id}  {args.instance_type} "
+                      f"(on-demand)", flush=True)
+            except subprocess.CalledProcessError as e:
+                print(f"FAILED  {arm}: {e.stderr.strip()[:300]}", flush=True)
+            continue
+
+        # Spot capacity is per (instance type, availability zone), and a single
+        # pool being empty says nothing about the others -- so walk the pools
+        # instead of giving up the parallelism. Only bf16-capable GPUs are
+        # candidates: a T4 would force fp16 and make that arm's numerics
+        # incomparable to the rest of the experiment.
+        placed = False
+        for itype in args.spot_types:
+            for subnet in args.subnets or [None]:
+                attempt = list(cmd)
+                attempt[attempt.index(args.instance_type)] = itype
+                if subnet:
+                    attempt += ["--subnet-id", subnet]
+                try:
+                    instance_id = sh(attempt)
+                    launched[arm] = instance_id
+                    where = f" {subnet}" if subnet else ""
+                    print(f"launched {arm:10s} {instance_id}  {itype} (spot){where}",
+                          flush=True)
+                    placed = True
+                    break
+                except subprocess.CalledProcessError as e:
+                    # "no capacity here" and "this AZ doesn't offer this type"
+                    # are both reasons to try the next pool, not to stop: an
+                    # AZ that cannot host g6 at all says nothing about the rest.
+                    skippable = ("InsufficientInstanceCapacity", "Unsupported")
+                    if not any(s in e.stderr for s in skippable):
+                        print(f"FAILED  {arm} [{itype}]: {e.stderr.strip()[:200]}",
+                              flush=True)
+                        break
+            if placed:
+                break
+        if not placed:
+            print(f"FAILED  {arm}: no spot capacity in any pool tried", flush=True)
 
     if launched:
         print("\n" + json.dumps(launched, indent=2))
