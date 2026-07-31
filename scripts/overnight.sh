@@ -106,12 +106,25 @@ while :; do
           # permission denied and silently took the whole chain with it.
           scp -o StrictHostKeyChecking=no -o ConnectTimeout=12 -i "$KEY" -q \
             scripts/box_kick.sh ubuntu@"$IP":/tmp/kick.sh >/dev/null 2>&1 </dev/null
-          $SSH ubuntu@"$IP" "sudo bash /tmp/kick.sh '$ARM' '$SU' '$FU' '$RU'" >/dev/null 2>&1 </dev/null
-          echo "POST_RUN_START $ARM"
+          KICK=$($SSH ubuntu@"$IP" \
+            "sudo bash /tmp/kick.sh '$ARM' '$SU' '$FU' '$RU'" 2>/dev/null </dev/null)
+          # Only record the arm as started once the box confirms it. A silently
+          # failed scp once left the kick running against a nonexistent file:
+          # the arm was marked started, never retried, and a finished on-demand
+          # box sat idle until someone looked.
+          case "$KICK" in
+            KICKED*|ALREADY*)
+              echo "POST_RUN_START $ARM"
+              started_post="$started_post $ARM"
+              ;;
+            *)
+              echo "POST_RUN_KICK_FAILED $ARM -- retrying next cycle"
+              ;;
+          esac
         else
           echo "TRAIN_FAILED $ARM rc=$DONE_RC"
+          started_post="$started_post $ARM"
         fi
-        started_post="$started_post $ARM"
         ;;
     esac
 
