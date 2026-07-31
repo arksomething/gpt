@@ -1,0 +1,45 @@
+# SFT v2: template v2 (EOS terminator), SmolTalk mixture with 25% chitchat.
+# initialize_from is set per-arm by the orchestrator.
+data:
+  block_size: 1024
+  dtype: uint16
+  indexed:
+    enabled: true
+    train_dir: data/chat/v2/indexed/train
+    val_dir: data/chat/v2/indexed/validation
+    tokenizer_sha256: d879422cadb5566190960da5fbe18b2163cb79df4bad192474c42bdb449a861f
+    verify_hashes: true
+    source_weights: null
+    validation_source_weights: null
+  streaming:
+    enabled: false
+data_prep:
+  tokenizer_model: tokenizer/spm.model
+training:
+  seed: 1337
+  micro_batch_size: 8
+  grad_accum_steps: 4
+  learning_rate: 5.0e-5
+  weight_decay: 0.1
+  betas: [0.9, 0.95]
+  warmup_steps: 20
+  max_steps: 280
+  eval_interval: 70
+  log_interval: 10
+  save_interval: 280
+  output_dir: runs/sft/placeholder
+  precision: bf16
+  max_grad_norm: 1.0
+  gradient_checkpointing: false
+  allow_tf32: true
+  checkpoint_limit: 1
+checkpoint_slots: {best: 0, good: []}
+checkpoint_upload: {enabled: false, repo_id: null, local_checkpoint_mode: persistent, keep_local_final: true, retry_max_attempts: 3, retry_backoff_seconds: 5, verify_upload: true, retention: {enabled: false, keep_latest: 1, keep_best: 1}}
+logging: {enabled: true, console_summary: true, log_file: auto, tensorboard: {enabled: false}, wandb: {enabled: false}}
+observability: {enabled: true, heartbeat_interval_steps: 10, state_file: run_state.json, events_file: events.jsonl, metrics_file: metrics.jsonl, budget_alarm_fractions: [0.5, 0.8, 0.95]}
+runtime_control: {enabled: false, poll_interval_steps: 10, cursor_path: null, allowed_updates: []}
+budget: {target_tokens: 9600000, hourly_rate: 0.81, max_cost: 2.0, throughput_path: runs/sft/throughput.json}
+checks:
+  source_eval: {enabled: false, batches: 10}
+  overfit_microset: {enabled: false, tokens: 100000, steps: 20, eval_batches: 5, min_drop: 0.3, warmup_steps: 0, log_interval: 10, run_on_smoke: false}
+  fixed_prompt: {enabled: false, run_on_smoke: false}

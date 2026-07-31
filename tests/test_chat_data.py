@@ -39,6 +39,11 @@ class _FixtureTokenizer:
     def bos_id(self):
         return 1
 
+    def eos_id(self):
+        # Template v2 terminates assistant turns with this single token instead
+        # of spelling out a five-piece "<|end|>" string.
+        return 2
+
     def encode(self, text, out_type=int):
         return [3 + (ord(char) % 23) for char in text]
 

@@ -16,7 +16,16 @@ import numpy as np
 
 IGNORE_INDEX = -100
 CHAT_TEMPLATE_NAME = "gpt-chatml"
-CHAT_TEMPLATE_VERSION = 1
+# v1 ended every turn with the literal string "<|end|>". The 32k SentencePiece
+# vocabulary has no reserved slots, so that string is five ordinary sub-pieces
+# ([12444, 31921, 451, 31921, 31966]) whose merges shift with context -- the
+# model had to spell a five-token sequence exactly to stop, and small models
+# routinely got one piece wrong and emitted debris like "|end|>". The regex stop
+# in chat_repl/chat_web hid the symptom rather than fixing it.
+#
+# v2 terminates assistant turns with the real EOS token, which is a single
+# unambiguous id the vocabulary already has, so generation stops natively.
+CHAT_TEMPLATE_VERSION = 2
 ROLE_MARKERS = {
     "system": "<|system|>",
     "user": "<|user|>",
@@ -103,6 +112,7 @@ def encode_conversation(
     *,
     add_bos: bool = True,
     require_final_assistant: bool = True,
+    template_version: int = CHAT_TEMPLATE_VERSION,
 ) -> EncodedConversation:
     """Encode messages and supervise assistant content plus its end marker."""
 
@@ -125,7 +135,14 @@ def encode_conversation(
             supervised=False,
         )
         content_tokens = _encode(tokenizer, content + "\n")
-        end_tokens = _encode(tokenizer, END_MARKER + "\n")
+        if template_version >= 2:
+            # One token, not five. Supervised, so the model learns to emit it.
+            eos_id = int(tokenizer.eos_id())
+            if eos_id < 0:
+                raise ChatFormatError("tokenizer has no eos id for template v2")
+            end_tokens = [eos_id]
+        else:
+            end_tokens = _encode(tokenizer, END_MARKER + "\n")
         if role == "assistant":
             start, _ = _append(
                 token_ids,
@@ -222,6 +239,7 @@ def template_metadata() -> dict[str, Any]:
         "name": CHAT_TEMPLATE_NAME,
         "version": CHAT_TEMPLATE_VERSION,
         "role_markers": dict(ROLE_MARKERS),
-        "end_marker": END_MARKER,
+        "end_marker": END_MARKER if CHAT_TEMPLATE_VERSION < 2 else "<eos>",
+        "terminator": "eos_token" if CHAT_TEMPLATE_VERSION >= 2 else "end_marker_string",
         "assistant_only_loss": True,
     }
