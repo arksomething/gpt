@@ -185,6 +185,19 @@ def main() -> None:
         cfg = f"configs/gate1/{arm}.yaml"
         if not os.path.exists(cfg):
             sys.exit(f"missing {cfg} -- run `uv run gate1-arms` first")
+        # Boxes clone from the remote, so a config that exists only locally is
+        # invisible to them: an arm was launched before its config was pushed
+        # and died on FileNotFoundError after paying for the whole bootstrap.
+        try:
+            subprocess.run(
+                ["git", "cat-file", "-e", f"origin/{args.branch}:{cfg}"],
+                check=True, capture_output=True,
+            )
+        except subprocess.CalledProcessError:
+            sys.exit(
+                f"{cfg} is not on origin/{args.branch}. The box clones the "
+                f"remote, so commit and push before launching."
+            )
 
     corpus_url = presign(args.bucket, args.corpus_key, args.url_ttl, "get")
     # The tar unpacks to a directory named after the corpus; the arm configs
