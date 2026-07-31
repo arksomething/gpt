@@ -75,9 +75,18 @@ cfg["training"]["output_dir"] = sys.argv[1]
 cfg["budget"]["throughput_path"] = sys.argv[1] + "/throughput.json"
 yaml.safe_dump(cfg, open("/tmp/sft_arm.yaml", "w"), sort_keys=False)
 PY
-  uv run train --train_config /tmp/sft_arm.yaml --model_config "$MODEL_CONFIG" \
-    --initialize_from "$CKPT" > "$RUNDIR/sft.log" 2>&1
-  echo $? > "$RUNDIR/RC_SFT"; ship
+  # Skip if an SFT already completed here. The overwrite guard in train.py
+  # would (correctly) refuse to clobber it, and reporting that as a stage
+  # failure hides which arms genuinely broke.
+  if [ -d "$SFTDIR/final" ]; then
+    log "sft already complete -- skipping"
+    echo 0 > "$RUNDIR/RC_SFT"
+  else
+    uv run train --train_config /tmp/sft_arm.yaml --model_config "$MODEL_CONFIG" \
+      --initialize_from "$CKPT" > "$RUNDIR/sft.log" 2>&1
+    echo $? > "$RUNDIR/RC_SFT"
+  fi
+  ship
 
   if [ -d "$SFTDIR/final" ]; then
     log "export sft"
