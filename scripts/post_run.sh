@@ -87,6 +87,21 @@ PY
       --tokenizer tokenizer/spm.model \
       --output "$RUNDIR/samples.jsonl" > "$RUNDIR/samples.log" 2>&1
     echo $? > "$RUNDIR/RC_SAMPLES"; ship
+
+    # --- 5. GRPO. At 25M the deliverable is a working harness, not a smarter
+    # model, so both environments are run for their diagnostics and the run is
+    # judged on whether rollout groups showed reward variance at all.
+    # format_constraint is the positive control: if its reward cannot move,
+    # the harness is broken and any other verdict is meaningless.
+    for ENV in format_constraint calibrated_abstention; do
+      log "grpo $ENV"
+      uv run $PIN --with trl python scripts/rl_train.py \
+        --model "$RUNDIR/hf-chat" --env "$ENV" \
+        --output_dir "$RUNDIR/rl-$ENV" \
+        --num_generations 8 --max_steps 40 --prompts 256 \
+        --max_completion_length 96 > "$RUNDIR/rl_$ENV.log" 2>&1
+      echo $? > "$RUNDIR/RC_RL_$ENV"; ship
+    done
   fi
 fi
 
