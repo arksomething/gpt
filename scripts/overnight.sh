@@ -93,8 +93,12 @@ while :; do
         if [ "$DONE_RC" = "0" ]; then
           SU=$(presign "results/$ARM.tar" put)
           FU=$(presign "sft-v2.tar" get)
-          $SSH ubuntu@"$IP" "cd /root/gpt && sudo git pull -q origin main; \
-            sudo setsid bash -c 'ARM=$ARM SHIP_URL=\"$SU\" SFT_URL=\"$FU\" nohup bash scripts/post_run.sh > /var/log/post_run.log 2>&1 </dev/null &'" >/dev/null 2>&1
+          # The repo lives under /root, so every step must run as root. An
+          # earlier version ran `cd /root/gpt` as ubuntu, which fails with
+          # permission denied and silently took the whole chain with it.
+          scp -o StrictHostKeyChecking=no -o ConnectTimeout=12 -i "$KEY" -q \
+            scripts/box_kick.sh ubuntu@"$IP":/tmp/kick.sh >/dev/null 2>&1
+          $SSH ubuntu@"$IP" "sudo bash /tmp/kick.sh '$ARM' '$SU' '$FU'" >/dev/null 2>&1
           echo "POST_RUN_START $ARM"
         else
           echo "TRAIN_FAILED $ARM rc=$DONE_RC"
