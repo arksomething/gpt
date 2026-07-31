@@ -177,6 +177,20 @@ def sparkline(points: List[Any], w: int = 240, h: int = 44) -> str:
 
 def build_html(arms: List[Dict[str, Any]], sigma: Optional[float]) -> str:
     e = html.escape
+    # Score every arm on the SAME sources. source_eval only evaluates the
+    # sources an arm trains on, so P4 -- the only arm with cosmopedia -- was
+    # averaging in a column the baselines did not have, which flattered it from
+    # 3.31 sigma worse to within noise. The comparable basis is the
+    # intersection.
+    per_sets = [
+        set(a["per_source"]) for a in arms
+        if not a["missing"] and a.get("per_source")
+    ]
+    common = set.intersection(*per_sets) if per_sets else set()
+    for a in arms:
+        ps = a.get("per_source") or {}
+        if common and ps:
+            a["uniform_loss"] = statistics.fmean([ps[k] for k in common])
     present = [a for a in arms if not a["missing"] and a.get("uniform_loss") is not None]
     baseline = [a for a in present if a["arm"].startswith("b0-")]
     b0_mean = (

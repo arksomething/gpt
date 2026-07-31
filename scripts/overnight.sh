@@ -23,7 +23,11 @@ KEY=$HOME/.ssh/gpt-aws.pem
 SSH="ssh -n -o StrictHostKeyChecking=no -o ConnectTimeout=12 -i $KEY"
 SG=sg-09ab4b5c96796e292
 SUBNETS="subnet-0d65a3210c0caee6c subnet-0d7d3ddad08b7f486 subnet-0399353261423516e subnet-06ea31b3cc0b5ef21 subnet-0c7178288a8c1e07f"
-QUEUE="${QUEUE:-p2 p3 p4 p5}"
+# ${VAR:-default} substitutes when VAR is empty OR unset, so a caller passing
+# an explicitly empty queue ("everything is already done") silently got the
+# full default back and relaunched a finished arm. ${VAR-default} only
+# substitutes when unset, which is the intended distinction.
+QUEUE="${QUEUE-p2 p3 p4 p5}"
 DEADLINE_UTC="${DEADLINE_UTC:?set DEADLINE_UTC epoch seconds}"
 RESULTS=results/collected
 mkdir -p "$RESULTS" logs
