@@ -81,7 +81,11 @@ while :; do
 
   ROWS=$(fleet)
   RUNNING=0
-  while read -r NAME IID IP; do
+  # Iterate over a saved copy rather than a live stream: any command inside the
+  # body that touches stdin would otherwise eat the remaining rows.
+  mapfile -t FLEET_ROWS <<< "$ROWS"
+  for _row in "${FLEET_ROWS[@]}"; do
+    read -r NAME IID IP <<< "$_row"
     [ -z "${IP:-}" ] && continue
     RUNNING=$((RUNNING+1))
     ARM="${NAME#gate1-}"
@@ -100,7 +104,7 @@ while :; do
           # earlier version ran `cd /root/gpt` as ubuntu, which fails with
           # permission denied and silently took the whole chain with it.
           scp -o StrictHostKeyChecking=no -o ConnectTimeout=12 -i "$KEY" -q \
-            scripts/box_kick.sh ubuntu@"$IP":/tmp/kick.sh >/dev/null 2>&1
+            scripts/box_kick.sh ubuntu@"$IP":/tmp/kick.sh >/dev/null 2>&1 </dev/null
           $SSH ubuntu@"$IP" "sudo bash /tmp/kick.sh '$ARM' '$SU' '$FU'" >/dev/null 2>&1 </dev/null
           echo "POST_RUN_START $ARM"
         else
@@ -126,7 +130,7 @@ while :; do
         echo "COLLECT_BAD_TAR $ARM -- leaving box up"
       fi
     fi
-  done <<< "$ROWS"
+  done
 
   # Fill freed capacity. 8 vCPU on-demand + 8 spot = 4 boxes of g6.xlarge.
   if [ "$RUNNING" -lt 4 ] && [ -n "${QUEUE// }" ]; then
