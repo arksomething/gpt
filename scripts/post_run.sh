@@ -16,6 +16,12 @@ RUNDIR="/root/gpt/runs/gate1/$ARM"
 MODEL_CONFIG="${MODEL_CONFIG:-configs/model_25m.yaml}"
 BENCH_LIMIT="${BENCH_LIMIT:-200}"
 PIN="--with transformers==4.49.0 --with protobuf --with sentencepiece"
+# uv is installed into /root/.local/bin by the bootstrap. This script runs as
+# root via sudo, whose PATH does not include it, so every uv stage exited 127
+# ("command not found") and the pipeline "completed" in 90 seconds having done
+# nothing.
+export PATH=/root/.local/bin:/usr/local/bin:/usr/bin:/bin:${PATH:-}
+export HOME=/root
 cd /root/gpt
 
 log() { echo "[post_run:$ARM] $(date -u +%H:%M:%S) $*"; }
