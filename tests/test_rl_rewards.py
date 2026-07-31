@@ -14,7 +14,7 @@ from scripts.rl_rewards import (  # noqa: E402
     reward_calibrated_answer,
     reward_length,
     reward_no_repetition,
-    reward_sentence_count,
+    reward_constraints,
     reward_termination,
 )
 
@@ -76,9 +76,26 @@ class MechanicalRewardTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             reward_length("x", 0)
 
-    def test_sentence_count(self):
-        self.assertEqual(reward_sentence_count("One. Two.", 2), 1.0)
-        self.assertEqual(reward_sentence_count("One. Two.", 3), 0.0)
+    def test_constraints_use_the_shared_eval_verifier(self):
+        """Reward and eval must agree on "passed" or we optimise an unmeasured bar."""
+        from scripts.conversation_eval import score_checks
+
+        text = "Leaves change color in autumn."
+        checks = {"max_words": 12, "requires_question": False}
+        self.assertEqual(
+            reward_constraints(text, checks, dense=False),
+            1.0 if score_checks(text, checks)["passed"] else 0.0,
+        )
+
+    def test_dense_scoring_avoids_dead_groups(self):
+        """All-or-nothing collapses to zero variance on multi-part instructions."""
+        checks = {"max_words": 5, "must_include_all": ["autumn"]}
+        partial = "Leaves change color in autumn because chlorophyll fades away"
+        # Fails max_words, satisfies must_include_all -> strictly between 0 and 1.
+        dense = reward_constraints(partial, checks, dense=True)
+        self.assertGreater(dense, 0.0)
+        self.assertLess(dense, 1.0)
+        self.assertEqual(reward_constraints(partial, checks, dense=False), 0.0)
 
 
 class CalibratedAbstentionTests(unittest.TestCase):

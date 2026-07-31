@@ -23,7 +23,6 @@ identical to a training curve that only logs the mean.
 from __future__ import annotations
 
 import math
-import re
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Sequence
 
@@ -109,20 +108,29 @@ def reward_length(text: str, target_words: int, tolerance: float = 0.5) -> float
     return max(0.0, 1.0 - rel / tolerance) if tolerance > 0 else float(rel == 0)
 
 
-def _sentence_count(text: str) -> int:
-    return len([s for s in re.split(r"[.!?]+", text) if s.strip()])
+def reward_constraints(text: str, checks: Dict[str, object], dense: bool = True) -> float:
+    """Score a response against the same constraint verifier the evals use.
 
+    Delegates to conversation_eval.score_checks rather than reimplementing
+    max_words / max_sentences / must_include / regex / json_type. Two copies of
+    "did it obey the instruction" would let the training reward and the
+    reported metric drift apart, so the model could be optimising a bar we are
+    not measuring -- and we would never see it.
 
-def reward_sentence_count(text: str, target: int) -> float:
-    return 1.0 if _sentence_count(text) == target else 0.0
+    dense=True returns the fraction of individual checks passed. GRPO needs
+    variance within a rollout group, and all-or-nothing scoring collapses to a
+    dead group as soon as every sample misses one clause of a multi-part
+    instruction.
+    """
+    from scripts.conversation_eval import score_checks  # local: torch import
 
-
-def reward_forbidden_substring(text: str, forbidden: str) -> float:
-    return 0.0 if forbidden.lower() in text.lower() else 1.0
-
-
-def reward_must_contain(text: str, required: str) -> float:
-    return 1.0 if required.lower() in text.lower() else 0.0
+    result = score_checks(text, checks)
+    individual = result.get("checks") or {}
+    if not individual:
+        return 1.0
+    if not dense:
+        return 1.0 if result["passed"] else 0.0
+    return sum(1.0 for v in individual.values() if v) / len(individual)
 
 
 # --------------------------------------------------------------------------
@@ -198,9 +206,9 @@ ENVIRONMENTS: Dict[str, Environment] = {
         ),
         Environment(
             "format_constraint",
-            "IFEval-style verifiable constraints (sentence counts, "
-            "required/forbidden strings).",
-            reward_sentence_count,
+            "IFEval-style verifiable constraints, scored by the same verifier "
+            "the conversation evals use (evals/conversation/v1.jsonl).",
+            reward_constraints,
             works_below_100m=True,
         ),
         Environment(

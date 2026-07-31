@@ -82,8 +82,16 @@ RUNDIR=/root/gpt/runs/gate1/{arm}
 
 ship() {{
   # Tar to a temp name and move into place so a PUT never reads a partial file.
+  #
+  # tar exits 1 with "file changed as we read it" whenever training writes a
+  # checkpoint mid-archive, which is routine here. Treating that as failure
+  # skipped the upload silently and shipped nothing for an entire run. Exit 1
+  # is a warning; only >=2 is fatal, and the archive being non-empty is the
+  # check that actually matters.
   mkdir -p "$RUNDIR"
-  tar -cf /tmp/ship.tmp -C /root/gpt/runs/gate1 {arm} 2>/dev/null || return 1
+  tar --warning=no-file-changed -cf /tmp/ship.tmp -C /root/gpt/runs/gate1 {arm} 2>/dev/null
+  rc=$?
+  [ "$rc" -le 1 ] && [ -s /tmp/ship.tmp ] || {{ echo "SHIP_TAR_FAIL rc=$rc"; return 1; }}
   mv -f /tmp/ship.tmp /tmp/ship.tar
   curl -fsS -X PUT --upload-file /tmp/ship.tar "{ship_url}" && echo "SHIPPED $(date -u +%H:%M:%S)"
 }}
