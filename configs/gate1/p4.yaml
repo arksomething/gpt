@@ -5,8 +5,8 @@ data:
   dtype: uint16
   indexed:
     enabled: true
-    train_dir: data/gate1/union-v1/train
-    val_dir: data/gate1/union-v1/validation
+    train_dir: data/gate1/union-v2/train
+    val_dir: data/gate1/union-v2/validation
     tokenizer_sha256: null
     recipe_sha256: null
     verify_hashes: true
@@ -23,8 +23,8 @@ data:
       code: 0.09
       narrative: 0.03
       wiki: 0.03
-      wikiteam: 0.005
-      libretexts: 0.015
+      wikiteam: 0.0045
+      libretexts: 0.0155
       cosmopedia: 0.15
     validation_source_weights: null
   streaming:

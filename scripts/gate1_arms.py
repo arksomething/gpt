@@ -1,6 +1,6 @@
 """Gate 1 mixture arms.
 
-Every arm trains on the same union corpus (``data/gate1/union-v1``) and differs
+Every arm trains on the same union corpus (``data/gate1/union-v2``) and differs
 only in ``data.indexed.source_weights``. Identical documents, identical
 tokenization, identical filtering: the only variable in the experiment is the
 sampling mixture, so corpus-construction variance cannot be mistaken for a
@@ -22,7 +22,7 @@ import yaml
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BASE_CONFIG = os.path.join(REPO_ROOT, "configs", "train_25m_probe.yaml")
 OUT_DIR = os.path.join(REPO_ROOT, "configs", "gate1")
-UNION_CORPUS = "data/gate1/union-v1"
+UNION_CORPUS = "data/gate1/union-v2"
 G6_XLARGE_HOURLY = 0.81  # us-east-1 on-demand; spot runs cost less, never more
 
 # The conversation sub-corpus. OASST's planned 0.5 point is folded into
@@ -42,7 +42,7 @@ CONVERSATION = {
 # 2% slice of a 250M-token run would have meant repeating it ten times over. That
 # is memorization, not a reference register. The mass moves to Wikipedia and
 # LibreTexts, which keeps the reference slice at 5 and keeps it de-monopolized.
-REFERENCE = {"wiki": 3.0, "wikiteam": 0.5, "libretexts": 1.5}
+REFERENCE = {"wiki": 3.0, "wikiteam": 0.45, "libretexts": 1.55}
 
 
 def _mix(**overrides: float) -> Dict[str, float]:
